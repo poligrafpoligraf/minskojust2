@@ -29,8 +29,19 @@ REGISTRY_IDS = [
 ]
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL_SECONDS", "900"))  # 15 минут по умолчанию
+# Получатели, вшитые прямо в код - не нужно ничего прописывать в Railway
+# Variables, чтобы им слать. Сейчас тут Даша (chat_id из её /start боту).
+EXTRA_CHAT_IDS = [
+    "71169408",  # Dasha Guskova (@dashasl)
+]
+# Плюс можно указать ещё получателей через запятую в переменной
+# TELEGRAM_CHAT_ID (формат тот же, что у REGISTRY_IDS) - список объединяется
+# с EXTRA_CHAT_IDS выше, повторы убираются.
+CHAT_IDS = list(dict.fromkeys(
+    EXTRA_CHAT_IDS
+    + [cid.strip() for cid in os.environ["TELEGRAM_CHAT_ID"].split(",") if cid.strip()]
+))
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL_SECONDS", "180"))  # 3 минуты по умолчанию
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 ERROR_ALERT_THRESHOLD = int(os.environ.get("ERROR_ALERT_THRESHOLD", "3"))  # алерт в ТГ после N подряд ошибок
 MAX_ROWS = int(os.environ.get("MAX_ROWS", "2000"))
@@ -68,15 +79,23 @@ TG_LIMIT = 3900  # запас к телеграмному лимиту в 4096 �
 
 
 def tg_send(text):
-    """Шлёт сообщение в Telegram, при необходимости разбивая на части."""
+    """Шлёт сообщение всем получателям из CHAT_IDS, при необходимости разбивая
+    длинный текст на части. Если для одного получателя отправка не удалась
+    (например, он ещё не написал боту /start), это не мешает отправить
+    остальным - ошибка просто попадёт в лог."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    for chunk in split_message(text):
-        r = requests.post(
-            url,
-            json={"chat_id": CHAT_ID, "text": chunk, "disable_web_page_preview": True},
-            timeout=15,
-        )
-        r.raise_for_status()
+    chunks = split_message(text)
+    for chat_id in CHAT_IDS:
+        try:
+            for chunk in chunks:
+                r = requests.post(
+                    url,
+                    json={"chat_id": chat_id, "text": chunk, "disable_web_page_preview": True},
+                    timeout=15,
+                )
+                r.raise_for_status()
+        except Exception:  # noqa: BLE001
+            log.exception("Не удалось отправить сообщение получателю %s", chat_id)
 
 
 def split_message(text):
@@ -268,8 +287,9 @@ def check_registry(registry_id, registry_state):
 
 def main():
     log.info(
-        "Старт. Реестров: %s. Интервал проверки: %s сек. Прокси: %s. Скрытые поля: %s",
+        "Старт. Реестров: %s. Получателей в Telegram: %s. Интервал проверки: %s сек. Прокси: %s. Скрытые поля: %s",
         len(REGISTRY_IDS),
+        len(CHAT_IDS),
         CHECK_INTERVAL,
         "включен" if PROXY_URL else "выключен (прямое подключение)",
         "показываются" if SHOW_HIDDEN_FIELDS else "не показываются",
