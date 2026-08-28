@@ -32,7 +32,8 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 # Получатели, вшитые прямо в код - не нужно ничего прописывать в Railway
 # Variables, чтобы им слать. Сейчас тут Даша (chat_id из её /start боту).
 EXTRA_CHAT_IDS = [
-    "71169408",  # Dasha Guskova (@dashasl)
+    "71169408",   # Dasha Guskova (@dashasl)
+    "119128292",  # Anton (@milchgesicht)
 ]
 # Плюс можно указать ещё получателей через запятую в переменной
 # TELEGRAM_CHAT_ID (формат тот же, что у REGISTRY_IDS) - список объединяется
@@ -285,6 +286,24 @@ def check_registry(registry_id, registry_state):
     registry_state["rows"] = new_rows
 
 
+def startup_message():
+    """Собирает стартовое сообщение со списком названий реестров (не ID) -
+    названия берём тем же запросом /info, которым бот и так пользуется для
+    проверок. Если у какого-то реестра не получилось получить название
+    (например, сайт на секунду недоступен) - показываем его ID, чтобы не
+    ронять всё сообщение целиком."""
+    lines = ["✅ Бот обновлён и перезапущен. Следит за реестрами:"]
+    for registry_id in REGISTRY_IDS:
+        try:
+            title = fetch_info(registry_id).get("title") or registry_id
+        except Exception:  # noqa: BLE001
+            log.exception("[%s] Не удалось получить название для стартового сообщения", registry_id)
+            title = registry_id
+        lines.append(f"• {title}")
+    lines.append(f"\nПолучателей: {len(CHAT_IDS)}. Интервал проверки: {CHECK_INTERVAL} сек.")
+    return "\n".join(lines)
+
+
 def main():
     log.info(
         "Старт. Реестров: %s. Получателей в Telegram: %s. Интервал проверки: %s сек. Прокси: %s. Скрытые поля: %s",
@@ -300,7 +319,7 @@ def main():
     consecutive_errors = {rid: 0 for rid in REGISTRY_IDS}
 
     try:
-        tg_send(f"✅ Бот-наблюдатель запущен. Реестров под наблюдением: {len(REGISTRY_IDS)}.")
+        tg_send(startup_message())
     except Exception:  # noqa: BLE001
         log.exception("Не удалось отправить стартовое сообщение в Telegram")
 
