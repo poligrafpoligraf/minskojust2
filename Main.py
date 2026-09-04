@@ -45,10 +45,25 @@ CHAT_IDS = list(dict.fromkeys(
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL_SECONDS", "180"))  # 3 минуты по умолчанию
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 ERROR_ALERT_THRESHOLD = int(os.environ.get("ERROR_ALERT_THRESHOLD", "3"))  # алерт в ТГ после N подряд ошибок
-MAX_ROWS = int(os.environ.get("MAX_ROWS", "2000"))
+# Потолок на общее число выкачиваемых записей - предохранитель, чтобы случайно
+# не начать тянуть реестр адвокатов на 157 тысяч строк.
+MAX_ROWS = int(os.environ.get("MAX_ROWS", "20000"))
+# ВАЖНО: API молча обрезает limit до 1000, сколько ни проси (проверено:
+# limit=2000 и limit=5000 оба возвращают ровно 1000 строк при size=1257).
+# Поэтому записи забираем страницами по 1000 через offset, иначе всё, что
+# в реестре после тысячной строки, для бота просто не существует - а новые
+# записи дописываются как раз в конец.
+PAGE_SIZE = 1000
 # Пауза между реестрами внутри одного цикла проверки - вежливости ради, чтобы
 # не долбить сайт пачкой запросов одновременно.
 REQUEST_DELAY = float(os.environ.get("REQUEST_DELAY_SECONDS", "2"))
+# Если изменений разом больше этого числа - шлём сводку вместо простыни
+# (например, когда реестр пополнили сотней записей за раз).
+MAX_DIFF_ITEMS = int(os.environ.get("MAX_DIFF_ITEMS", "40"))
+# Версия формата снимка. Если в state лежит снимок старого формата (снятый,
+# когда бот видел только первую 1000 строк), diff по нему дал бы ложную пачку
+# "добавлено 257 записей" - поэтому такой снимок молча переснимаем.
+STATE_VERSION = 2
 
 # Показывать ли поля, которые скрыты в таблице на сайте (дата рождения, ИНН,
 # СНИЛС, номера счетов и т.п.). API их отдаёт, но сообщения становятся длинными.
@@ -149,20 +164,58 @@ def fetch_info(registry_id):
 
 
 def fetch_rows(registry_id):
-    r = requests.post(
-        f"{BASE}/rest/registry/{registry_id}/values",
-        json={"limit": MAX_ROWS},
-        headers={"accept": "application/json"},
-        proxies=PROXIES,
-        verify=VERIFY_SSL,
-        timeout=20,
-    )
-    r.raise_for_status()
-    data = r.json()
+    """Забирает ВСЕ записи реестра, страницами по PAGE_SIZE.
+
+    Один запрос отдаёт максимум 1000 строк независимо от запрошенного limit,
+    поэтому идём по offset, пока не выберем всё (поле size в ответе - общее
+    число записей в реестре)."""
     rows = {}
-    for i, row in enumerate(data.get("values", [])):
-        # у записей есть свой id; если вдруг нет - подставляем порядковый номер
-        rows[str(row.get("id") or f"_idx_{i}")] = row
+    offset = 0
+    total = None
+
+    while True:
+        r = requests.post(
+            f"{BASE}/rest/registry/{registry_id}/values",
+            json={"limit": PAGE_SIZE, "offset": offset},
+            headers={"accept": "application/json"},
+            proxies=PROXIES,
+            verify=VERIFY_SSL,
+            timeout=30,
+        )
+        r.raise_for_status()
+        data = r.json()
+        values = data.get("values", [])
+        if total is None:
+            total = data.get("size")
+
+        for i, row in enumerate(values):
+            # у записей есть свой id; если вдруг нет - подставляем порядковый номер
+            rows[str(row.get("id") or f"_idx_{offset + i}")] = row
+
+        offset += len(values)
+
+        if not values:
+            break
+        if total is not None and offset >= total:
+            break
+        if offset >= MAX_ROWS:
+            log.warning(
+                "[%s] Достигнут потолок MAX_ROWS=%s, в реестре записей: %s - "
+                "остальные не проверяются",
+                registry_id,
+                MAX_ROWS,
+                total,
+            )
+            break
+        time.sleep(REQUEST_DELAY)
+
+    if total is not None and len(rows) < total:
+        log.warning(
+            "[%s] Получено %s записей из %s заявленных",
+            registry_id,
+            len(rows),
+            total,
+        )
     return rows
 
 
@@ -205,16 +258,27 @@ def format_row(row, labels):
 
 
 def diff_rows(old, new, labels):
-    """Человекочитаемое описание отличий между двумя снимками реестра."""
+    """Отличия между двумя снимками реестра.
+
+    Возвращает список словарей {kind, title, text}, чтобы дальше можно было
+    либо расписать всё подробно, либо свернуть в сводку."""
     parts = []
 
     for row_id, row in new.items():
         if row_id not in old:
-            parts.append(f"➕ ДОБАВЛЕНА ЗАПИСЬ\n{format_row(row, labels)}")
+            parts.append({
+                "kind": "added",
+                "title": row_title(row, labels),
+                "text": f"➕ ДОБАВЛЕНА ЗАПИСЬ\n{format_row(row, labels)}",
+            })
 
     for row_id, row in old.items():
         if row_id not in new:
-            parts.append(f"➖ УДАЛЕНА ЗАПИСЬ\n{format_row(row, labels)}")
+            parts.append({
+                "kind": "removed",
+                "title": row_title(row, labels),
+                "text": f"➖ УДАЛЕНА ЗАПИСЬ\n{format_row(row, labels)}",
+            })
 
     for row_id, new_row in new.items():
         old_row = old.get(row_id)
@@ -227,9 +291,66 @@ def diff_rows(old, new, labels):
                 human, _ = labels[name]
                 changes.append(f"  {human}:\n    было: {before or '(пусто)'}\n    стало: {after or '(пусто)'}")
         if changes:
-            parts.append(f"✏️ ИЗМЕНЕНА ЗАПИСЬ: {row_title(new_row, labels)}\n" + "\n".join(changes))
+            title = row_title(new_row, labels)
+            parts.append({
+                "kind": "changed",
+                "title": title,
+                "text": f"✏️ ИЗМЕНЕНА ЗАПИСЬ: {title}\n" + "\n".join(changes),
+            })
 
     return parts
+
+
+def format_diff(parts):
+    """Текст изменений для сообщения. Если изменений слишком много - вместо
+    полной простыни шлём сводку со списком имён/названий."""
+    if len(parts) <= MAX_DIFF_ITEMS:
+        return "\n\n".join(p["text"] for p in parts)
+
+    buckets = {"added": [], "removed": [], "changed": []}
+    for p in parts:
+        buckets[p["kind"]].append(p["title"])
+
+    headers = {
+        "added": "➕ Добавлено",
+        "removed": "➖ Удалено",
+        "changed": "✏️ Изменено",
+    }
+    lines = [f"Изменений сразу много - {len(parts)}, шлю кратко:"]
+    for kind in ("added", "removed", "changed"):
+        titles = buckets[kind]
+        if not titles:
+            continue
+        lines.append(f"\n{headers[kind]}: {len(titles)}")
+        shown = titles[:MAX_DIFF_ITEMS]
+        lines.extend(f"• {t}" for t in shown)
+        if len(titles) > len(shown):
+            lines.append(f"…и ещё {len(titles) - len(shown)}")
+    return "\n".join(lines)
+
+
+# Группы изменений уходят ОТДЕЛЬНЫМИ сообщениями и именно в этом порядке:
+# сначала новые записи (самое интересное), потом удаления, потом правки в
+# старых записях. Так новое приходит коротким отдельным уведомлением, а не
+# тонет в хвосте длинной простыни с правками.
+DIFF_GROUPS = (
+    ("added", "➕ Новые записи в реестре"),
+    ("removed", "➖ Записи удалены из реестра"),
+    ("changed", "✏️ Правки в существующих записях"),
+)
+
+
+def send_changes(title, page_url, parts):
+    """Шлёт изменения, разбив по типам: добавления - одним сообщением,
+    удаления - другим, правки - третьим. Пустые группы пропускаем."""
+    for kind, header in DIFF_GROUPS:
+        group = [p for p in parts if p["kind"] == kind]
+        if not group:
+            continue
+        tg_send(
+            f"🔔 {header}: {len(group)}\n{title}\n{page_url}\n\n"
+            f"{format_diff(group)}"
+        )
 
 
 def check_registry(registry_id, registry_state):
@@ -243,15 +364,20 @@ def check_registry(registry_id, registry_state):
     last_modified = info.get("lastModified")
     prev_last_modified = registry_state.get("lastModified")
     prev_rows = registry_state.get("rows")
+    prev_version = registry_state.get("version")
 
-    # первый запуск для этого реестра (или потеря состояния) - просто
-    # запоминаем текущую картину, без алерта
-    if prev_last_modified is None or prev_rows is None:
+    # Первый запуск для этого реестра (или потеря состояния) - просто
+    # запоминаем текущую картину, без алерта. Снимок старого формата
+    # (version < 2, снятый когда бот видел лишь первую 1000 строк) тоже
+    # переснимаем молча, иначе прилетела бы пачка ложных "добавлено".
+    if prev_last_modified is None or prev_rows is None or prev_version != STATE_VERSION:
         registry_state["lastModified"] = last_modified
         registry_state["rows"] = fetch_rows(registry_id)
+        registry_state["version"] = STATE_VERSION
         log.info(
-            "[%s] Инициализация: %s записей, lastModified=%s",
+            "[%s] %s: %s записей, lastModified=%s",
             title,
+            "Инициализация" if prev_rows is None else "Пересъёмка снимка (новый формат)",
             len(registry_state["rows"]),
             last_modified,
         )
@@ -266,24 +392,29 @@ def check_registry(registry_id, registry_state):
     try:
         new_rows = fetch_rows(registry_id)
         parts = diff_rows(prev_rows, new_rows, labels)
-        if parts:
-            body = "\n\n".join(parts)
-        else:
-            # метка времени сдвинулась, но видимые поля те же - могли
-            # поменяться скрытые или служебные поля
-            body = (
-                "Данные в видимых полях не изменились - вероятно, правка "
-                "коснулась скрытых или служебных полей."
-            )
     except Exception as e:  # noqa: BLE001
         log.exception("[%s] Не удалось получить содержимое реестра", title)
         new_rows = prev_rows
-        body = f"(не удалось получить содержимое: {e})"
+        parts = None
+        tg_send(
+            f"🔔 Реестр обновился!\n{title}\n{page_url}\n\n"
+            f"(не удалось получить содержимое: {e})"
+        )
 
-    tg_send(f"🔔 Реестр обновился!\n{title}\n{page_url}\n\n{body}")
+    if parts:
+        send_changes(title, page_url, parts)
+    elif parts is not None:
+        # метка времени сдвинулась, но видимые поля те же - могли
+        # поменяться скрытые или служебные поля
+        tg_send(
+            f"🔔 Реестр обновился!\n{title}\n{page_url}\n\n"
+            "Данные в видимых полях не изменились - вероятно, правка "
+            "коснулась скрытых или служебных полей."
+        )
 
     registry_state["lastModified"] = last_modified
     registry_state["rows"] = new_rows
+    registry_state["version"] = STATE_VERSION
 
 
 def startup_message():
