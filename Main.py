@@ -1,9 +1,14 @@
 import os
+import re
 import json
 import time
 import logging
+from datetime import datetime, timedelta
+from urllib.parse import urljoin
+from zoneinfo import ZoneInfo
 
 import requests
+from bs4 import BeautifulSoup
 
 BASE = "https://reestrs.minjust.gov.ru"
 
@@ -64,6 +69,41 @@ MAX_DIFF_ITEMS = int(os.environ.get("MAX_DIFF_ITEMS", "40"))
 # когда бот видел только первую 1000 строк), diff по нему дал бы ложную пачку
 # "добавлено 257 записей" - поэтому такой снимок молча переснимаем.
 STATE_VERSION = 2
+
+# ---------------------------------------------------------------------------
+# Наблюдение за обычными страницами со списком ссылок (не реестры с API)
+# ---------------------------------------------------------------------------
+# Каждый наблюдатель - это страница, на которой нас интересует список ссылок
+# внутри одного блока. Бот запоминает список и сообщает, что добавилось,
+# что пропало и что переименовали.
+#
+#   key       - короткое имя, под ним состояние лежит в state.json
+#   title     - как называть страницу в сообщениях
+#   url       - что скачивать
+#   selector  - CSS-селектор ссылок (как в браузере)
+#   encoding  - кодировка страницы; cdep.ru отдаёт windows-1251 и не пишет
+#               об этом в заголовке, поэтому задаём явно, иначе вместо
+#               русского текста придёт каша
+PAGE_WATCHERS = [
+    {
+        "key": "cdep_sudstat",
+        "title": "Судебный департамент - данные судебной статистики",
+        "url": "https://cdep.ru/?id=79",
+        "selector": "div.contentBody.customArea a",
+        "encoding": "windows-1251",
+    },
+]
+
+# Страницы проверяем не по таймеру, а в заданные часы по местному времени:
+# данные там полугодовые, чаще смысла нет.
+PAGE_CHECK_HOURS = [
+    int(h.strip())
+    for h in os.environ.get("PAGE_CHECK_HOURS", "9,14,22").split(",")
+    if h.strip()
+]
+# Europe/Berlin - это CET зимой и CEST летом, то есть "9 утра" остаётся
+# девятью утра по стенным часам круглый год.
+PAGE_CHECK_TZ = os.environ.get("PAGE_CHECK_TZ", "Europe/Berlin")
 
 # Показывать ли поля, которые скрыты в таблице на сайте (дата рождения, ИНН,
 # СНИЛС, номера счетов и т.п.). API их отдаёт, но сообщения становятся длинными.
@@ -417,6 +457,150 @@ def check_registry(registry_id, registry_state):
     registry_state["version"] = STATE_VERSION
 
 
+# ---------------------------------------------------------------------------
+# Проверка страниц со списком ссылок
+# ---------------------------------------------------------------------------
+
+def page_item_key(href, text):
+    """Устойчивый ключ ссылки. На cdep.ru у каждого набора свой номер в адресе
+    (?id=79&item=9291) - по нему видно, что набор тот же самый, даже если его
+    переименовали. Если номера нет, ключом будет сам адрес, а в крайнем
+    случае - текст ссылки."""
+    match = re.search(r"item=(\d+)", href or "")
+    if match:
+        return f"item{match.group(1)}"
+    return (href or "").strip() or (text or "").strip()
+
+
+def fetch_page_items(watcher):
+    """Скачивает страницу и возвращает {ключ: {title, href}} по её ссылкам."""
+    r = requests.get(
+        watcher["url"],
+        headers={
+            "accept": "text/html,application/xhtml+xml",
+            # без внятного User-Agent некоторые сайты отдают заглушку
+            "user-agent": "Mozilla/5.0 (compatible; reestr-watch-bot/1.0)",
+        },
+        proxies=PROXIES,
+        verify=VERIFY_SSL,
+        timeout=30,
+    )
+    r.raise_for_status()
+
+    # Сайт не сообщает кодировку в заголовке, а requests в таком случае
+    # угадывает latin-1 и превращает русский текст в мусор. Задаём явно.
+    encoding = watcher.get("encoding")
+    if encoding:
+        r.encoding = encoding
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    items = {}
+    for a in soup.select(watcher["selector"]):
+        text = " ".join(a.get_text().split())
+        href = (a.get("href") or "").strip()
+        if not text:
+            continue
+        items[page_item_key(href, text)] = {
+            "title": text,
+            "href": urljoin(watcher["url"], href),
+        }
+    return items
+
+
+def diff_page_items(old, new):
+    """Что изменилось в списке ссылок: добавили, убрали, переименовали."""
+    parts = []
+
+    for key, item in new.items():
+        if key not in old:
+            parts.append({
+                "kind": "added",
+                "title": item["title"],
+                "text": f"➕ НОВЫЙ НАБОР\n{item['title']}\n{item['href']}",
+            })
+
+    for key, item in old.items():
+        if key not in new:
+            parts.append({
+                "kind": "removed",
+                "title": item["title"],
+                "text": f"➖ НАБОР ПРОПАЛ СО СТРАНИЦЫ\n{item['title']}\n{item['href']}",
+            })
+
+    for key, item in new.items():
+        was = old.get(key)
+        if was and was.get("title") != item["title"]:
+            parts.append({
+                "kind": "changed",
+                "title": item["title"],
+                "text": (
+                    f"✏️ НАБОР ПЕРЕИМЕНОВАН\n"
+                    f"  было: {was.get('title')}\n"
+                    f"  стало: {item['title']}\n{item['href']}"
+                ),
+            })
+
+    return parts
+
+
+PAGE_DIFF_GROUPS = (
+    ("added", "➕ Новые наборы данных"),
+    ("removed", "➖ Наборы пропали со страницы"),
+    ("changed", "✏️ Наборы переименованы"),
+)
+
+
+def check_page_watcher(watcher, watcher_state):
+    """Проверяет одну страницу. Первый раз - молча запоминает список."""
+    items = fetch_page_items(watcher)
+    if not items:
+        # пустой список почти наверняка значит, что вёрстка поменялась или
+        # вместо страницы приехала заглушка - лучше упасть, чем решить, что
+        # "всё удалили", и разослать панику
+        raise RuntimeError(
+            f"по селектору '{watcher['selector']}' не найдено ни одной ссылки - "
+            "возможно, изменилась вёрстка страницы"
+        )
+
+    prev_items = watcher_state.get("items")
+    if prev_items is None:
+        watcher_state["items"] = items
+        log.info("[%s] Инициализация: %s ссылок", watcher["title"], len(items))
+        return
+
+    parts = diff_page_items(prev_items, items)
+    if not parts:
+        log.info("[%s] Без изменений (%s ссылок)", watcher["title"], len(items))
+        watcher_state["items"] = items
+        return
+
+    log.info("[%s] Изменений: %s", watcher["title"], len(parts))
+    for kind, header in PAGE_DIFF_GROUPS:
+        group = [p for p in parts if p["kind"] == kind]
+        if not group:
+            continue
+        tg_send(
+            f"🔔 {header}: {len(group)}\n{watcher['title']}\n{watcher['url']}\n\n"
+            f"{format_diff(group)}"
+        )
+
+    watcher_state["items"] = items
+
+
+def current_page_slot(now=None):
+    """Последний наступивший момент проверки страниц - строкой вида
+    '2026-09-07T09'. Пока эта строка не сменилась, повторно не проверяем,
+    так что перезапуск бота не приводит к лишним заходам на сайт."""
+    if not PAGE_CHECK_HOURS:
+        return None
+    tz = ZoneInfo(PAGE_CHECK_TZ)
+    now = now or datetime.now(tz)
+    today = [now.replace(hour=h, minute=0, second=0, microsecond=0) for h in sorted(PAGE_CHECK_HOURS)]
+    past = [slot for slot in today if slot <= now]
+    slot = past[-1] if past else today[-1] - timedelta(days=1)
+    return slot.strftime("%Y-%m-%dT%H")
+
+
 def startup_message():
     """Собирает стартовое сообщение со списком названий реестров (не ID) -
     названия берём тем же запросом /info, которым бот и так пользуется для
@@ -431,7 +615,14 @@ def startup_message():
             log.exception("[%s] Не удалось получить название для стартового сообщения", registry_id)
             title = registry_id
         lines.append(f"• {title}")
-    lines.append(f"\nПолучателей: {len(CHAT_IDS)}. Интервал проверки: {CHECK_INTERVAL} сек.")
+
+    if PAGE_WATCHERS:
+        hours = ", ".join(f"{h}:00" for h in sorted(PAGE_CHECK_HOURS))
+        lines.append(f"\nИ за страницами (проверка в {hours} по {PAGE_CHECK_TZ}):")
+        for watcher in PAGE_WATCHERS:
+            lines.append(f"• {watcher['title']}")
+
+    lines.append(f"\nПолучателей: {len(CHAT_IDS)}. Интервал проверки реестров: {CHECK_INTERVAL} сек.")
     return "\n".join(lines)
 
 
@@ -448,6 +639,7 @@ def main():
     # счётчик подряд идущих ошибок отдельно на каждый реестр, чтобы один
     # упавший реестр не топил алертами остальные и не мешал их проверке
     consecutive_errors = {rid: 0 for rid in REGISTRY_IDS}
+    page_errors = {w["key"]: 0 for w in PAGE_WATCHERS}
 
     try:
         tg_send(startup_message())
@@ -481,6 +673,50 @@ def main():
                 save_state(state)
             if i < len(REGISTRY_IDS) - 1:
                 time.sleep(REQUEST_DELAY)
+
+        # Страницы - по расписанию, а не каждый цикл. Если с прошлой проверки
+        # наступил новый назначенный час, обходим их один раз.
+        slot = current_page_slot()
+        pages_state = state.setdefault("pages", {})
+        for watcher in PAGE_WATCHERS:
+            watcher_state = pages_state.setdefault(watcher["key"], {})
+            if slot is None or watcher_state.get("slot") == slot:
+                continue
+            try:
+                check_page_watcher(watcher, watcher_state)
+                watcher_state["slot"] = slot
+                if page_errors[watcher["key"]] >= ERROR_ALERT_THRESHOLD:
+                    tg_send(f"✅ Страница снова доступна, проверки восстановлены:\n{watcher['url']}")
+                page_errors[watcher["key"]] = 0
+            except Exception as e:  # noqa: BLE001
+                page_errors[watcher["key"]] += 1
+                log.exception(
+                    "[%s] Ошибка проверки страницы (%s подряд): %s",
+                    watcher["title"],
+                    page_errors[watcher["key"]],
+                    e,
+                )
+                if page_errors[watcher["key"]] == ERROR_ALERT_THRESHOLD:
+                    try:
+                        tg_send(
+                            f"⚠️ Не получается проверить страницу уже "
+                            f"{page_errors[watcher['key']]} раза подряд:\n"
+                            f"{watcher['url']}\n{e}"
+                        )
+                    except Exception:  # noqa: BLE001
+                        log.exception("И в Telegram написать тоже не вышло")
+                if page_errors[watcher["key"]] >= ERROR_ALERT_THRESHOLD:
+                    # Про поломку уже сообщили - перестаём долбить сайт каждые
+                    # три минуты и ждём следующего назначенного часа.
+                    watcher_state["slot"] = slot
+                    log.warning(
+                        "[%s] Пропускаем до следующей проверки по расписанию",
+                        watcher["title"],
+                    )
+            finally:
+                save_state(state)
+            time.sleep(REQUEST_DELAY)
+
         time.sleep(CHECK_INTERVAL)
 
 
