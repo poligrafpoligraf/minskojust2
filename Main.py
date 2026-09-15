@@ -47,7 +47,7 @@ CHAT_IDS = list(dict.fromkeys(
     EXTRA_CHAT_IDS
     + [cid.strip() for cid in os.environ["TELEGRAM_CHAT_ID"].split(",") if cid.strip()]
 ))
-CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL_SECONDS", "180"))  # 3 минуты по умолчанию
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL_SECONDS", "90"))  # 1,5 минуты по умолчанию
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 ERROR_ALERT_THRESHOLD = int(os.environ.get("ERROR_ALERT_THRESHOLD", "3"))  # алерт в ТГ после N подряд ошибок
 # Потолок на общее число выкачиваемых записей - предохранитель, чтобы случайно
@@ -80,17 +80,32 @@ STATE_VERSION = 2
 #   key       - короткое имя, под ним состояние лежит в state.json
 #   title     - как называть страницу в сообщениях
 #   url       - что скачивать
-#   selector  - CSS-селектор ссылок (как в браузере)
+#   type      - "links" (список ссылок) или "table_tail" (хвост таблицы
+#               с постраничной навигацией)
+#   selector  - для "links": CSS-селектор ссылок (как в браузере)
 #   encoding  - кодировка страницы; cdep.ru отдаёт windows-1251 и не пишет
 #               об этом в заголовке, поэтому задаём явно, иначе вместо
 #               русского текста придёт каша
 PAGE_WATCHERS = [
     {
         "key": "cdep_sudstat",
+        "type": "links",
         "title": "Судебный департамент - данные судебной статистики",
         "url": "https://cdep.ru/?id=79",
         "selector": "div.contentBody.customArea a",
         "encoding": "windows-1251",
+    },
+    {
+        # Федеральный список экстремистских материалов - таблица на ~5500
+        # пунктов, разбитая на страницы по 100 штук. Новые пункты всегда
+        # дописываются в конец, поэтому смотрим только последнюю страницу:
+        # два запроса вместо полусотни. Оборотная сторона - исключение
+        # пункта из середины списка бот не заметит (см. README).
+        "key": "minjust_extremist_materials",
+        "type": "table_tail",
+        "title": "Федеральный список экстремистских материалов",
+        "url": "https://minjust.gov.ru/ru/extremist-materials/",
+        "encoding": "utf-8",
     },
 ]
 
@@ -421,11 +436,11 @@ def check_registry(registry_id, registry_state):
             len(registry_state["rows"]),
             last_modified,
         )
-        return
+        return True
 
     if last_modified == prev_last_modified:
         log.info("[%s] Без изменений (lastModified=%s)", title, last_modified)
-        return
+        return False
 
     log.info("[%s] Обнаружено изменение: %s -> %s", title, prev_last_modified, last_modified)
 
@@ -455,6 +470,7 @@ def check_registry(registry_id, registry_state):
     registry_state["lastModified"] = last_modified
     registry_state["rows"] = new_rows
     registry_state["version"] = STATE_VERSION
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -472,10 +488,10 @@ def page_item_key(href, text):
     return (href or "").strip() or (text or "").strip()
 
 
-def fetch_page_items(watcher):
-    """Скачивает страницу и возвращает {ключ: {title, href}} по её ссылкам."""
+def fetch_soup(url, encoding=None):
+    """Скачивает страницу и отдаёт разобранный HTML."""
     r = requests.get(
-        watcher["url"],
+        url,
         headers={
             "accept": "text/html,application/xhtml+xml",
             # без внятного User-Agent некоторые сайты отдают заглушку
@@ -487,13 +503,17 @@ def fetch_page_items(watcher):
     )
     r.raise_for_status()
 
-    # Сайт не сообщает кодировку в заголовке, а requests в таком случае
-    # угадывает latin-1 и превращает русский текст в мусор. Задаём явно.
-    encoding = watcher.get("encoding")
+    # Некоторые сайты не сообщают кодировку в заголовке, а requests в таком
+    # случае угадывает latin-1 и превращает русский текст в мусор.
     if encoding:
         r.encoding = encoding
 
-    soup = BeautifulSoup(r.text, "html.parser")
+    return BeautifulSoup(r.text, "html.parser")
+
+
+def fetch_page_items(watcher):
+    """Скачивает страницу и возвращает {ключ: {title, href}} по её ссылкам."""
+    soup = fetch_soup(watcher["url"], watcher.get("encoding"))
     items = {}
     for a in soup.select(watcher["selector"]):
         text = " ".join(a.get_text().split())
@@ -505,6 +525,117 @@ def fetch_page_items(watcher):
             "href": urljoin(watcher["url"], href),
         }
     return items
+
+
+def last_page_number(soup):
+    """Сколько всего страниц в постраничной навигации."""
+    numbers = []
+    for a in soup.find_all("a"):
+        text = a.get_text().strip()
+        if text.isdigit():
+            numbers.append(int(text))
+        match = re.search(r"[?&]page=(\d+)", a.get("href") or "")
+        if match:
+            numbers.append(int(match.group(1)))
+    return max(numbers) if numbers else 1
+
+
+def parse_table_rows(soup):
+    """Строки таблицы вида «№ | текст | дата» в {ключ: {num, text, date}}."""
+    items = {}
+    for tr in soup.select("table tr"):
+        cells = [" ".join(td.get_text().split()) for td in tr.find_all("td")]
+        if len(cells) < 3 or not cells[0].isdigit():
+            continue
+        num = int(cells[0])
+        items[f"m{num}"] = {"num": num, "text": cells[1], "date": cells[2]}
+    return items
+
+
+def fetch_table_tail(watcher):
+    """Забирает последнюю страницу постраничной таблицы.
+
+    Пункты в таких списках дописываются в конец, поэтому хватает двух
+    запросов: первая страница - узнать, сколько их всего, и последняя -
+    за самими записями."""
+    encoding = watcher.get("encoding")
+    first = fetch_soup(watcher["url"], encoding)
+    pages = last_page_number(first)
+
+    if pages <= 1:
+        return parse_table_rows(first), pages
+
+    # пауза между запросами: сайт не любит, когда страницы дёргают подряд
+    time.sleep(REQUEST_DELAY)
+    separator = "&" if "?" in watcher["url"] else "?"
+    last = fetch_soup(f"{watcher['url']}{separator}page={pages}", encoding)
+    return parse_table_rows(last), pages
+
+
+def court_decision(text):
+    """Вытаскивает первое решение суда из описания: «... (решение
+    Пензенского областного суда от 15.07.2026, апелляционное ...)» ->
+    «Пензенский областной суд от 15.07.2026». Если формат другой - None,
+    и строку про суд просто не показываем, чтобы ничего не выдумывать."""
+    match = re.search(r"решени[ея]\s+(.+?)\s+от\s+(\d{1,2}\.\d{1,2}\.\d{4})", text or "")
+    if not match:
+        return None
+    court = match.group(1).strip()
+    # в старых записях встречается «решение вынесено ... судом ... от ...»
+    court = re.sub(r"^вынесено\s+", "", court)
+    return f"{court} от {match.group(2)}"
+
+
+def format_material(item, marker):
+    """Сообщение про один пункт списка. Описание идёт целиком, как на сайте,
+    без сокращений - оно редко длиннее 700 символов."""
+    lines = [f"{marker} №{item['num']}"]
+    if item.get("date"):
+        lines.append(f"Внесён в список: {item['date']}")
+    decision = court_decision(item.get("text"))
+    if decision:
+        lines.append(f"Решение: {decision}")
+    lines.append("")
+    lines.append(item.get("text") or "(без описания)")
+    return "\n".join(lines)
+
+
+def diff_table_items(old, new):
+    """Что изменилось в хвосте таблицы: добавили, убрали, поправили текст."""
+    parts = []
+
+    for key, item in sorted(new.items(), key=lambda kv: kv[1]["num"]):
+        if key not in old:
+            parts.append({
+                "kind": "added",
+                "title": f"№{item['num']}",
+                "text": format_material(item, "➕ НОВЫЙ МАТЕРИАЛ"),
+            })
+
+    # Исключения из списка здесь НЕ ловим, и это осознанно. Мы видим только
+    # последнюю страницу, поэтому "пункт пропал из нашего окна" и "пункт
+    # исключили" неотличимы. Хуже того: когда последняя страница заполнится
+    # и начнётся следующая, из окна разом выпадут все 100 пунктов прежней -
+    # и бот отрапортовал бы "исключено 100 материалов", хотя не изменилось
+    # ничего. Для настоящей ловли исключений нужен полный обход всех страниц.
+
+    for key, item in sorted(new.items(), key=lambda kv: kv[1]["num"]):
+        was = old.get(key)
+        if not was:
+            continue
+        changes = []
+        if was.get("text") != item.get("text"):
+            changes.append(f"  было: {was.get('text')}\n  стало: {item.get('text')}")
+        if was.get("date") != item.get("date"):
+            changes.append(f"  дата внесения: {was.get('date')} -> {item.get('date')}")
+        if changes:
+            parts.append({
+                "kind": "changed",
+                "title": f"№{item['num']}",
+                "text": f"✏️ МАТЕРИАЛ ИЗМЕНЁН №{item['num']}\n" + "\n".join(changes),
+            })
+
+    return parts
 
 
 def diff_page_items(old, new):
@@ -549,42 +680,62 @@ PAGE_DIFF_GROUPS = (
     ("changed", "✏️ Наборы переименованы"),
 )
 
+TABLE_DIFF_GROUPS = (
+    ("added", "➕ Новые материалы в списке"),
+    ("changed", "✏️ Материалы изменены"),
+)
+
 
 def check_page_watcher(watcher, watcher_state):
-    """Проверяет одну страницу. Первый раз - молча запоминает список."""
-    items = fetch_page_items(watcher)
+    """Проверяет одну страницу. Первый раз - молча запоминает содержимое."""
+    kind = watcher.get("type", "links")
+
+    if kind == "table_tail":
+        items, pages = fetch_table_tail(watcher)
+        page_url = f"{watcher['url']}{'&' if '?' in watcher['url'] else '?'}page={pages}"
+        diff = diff_table_items
+        groups = TABLE_DIFF_GROUPS
+        # описания тут длинные и осмысленные, сокращать их до списка номеров
+        # бессмысленно - шлём всегда целиком, Telegram сам разобьёт на части
+        full_text = True
+        empty_error = "в таблице не найдено ни одной строки"
+        unit = "строк"
+    else:
+        items = fetch_page_items(watcher)
+        page_url = watcher["url"]
+        diff = diff_page_items
+        groups = PAGE_DIFF_GROUPS
+        full_text = False
+        empty_error = f"по селектору '{watcher.get('selector')}' не найдено ни одной ссылки"
+        unit = "ссылок"
+
     if not items:
-        # пустой список почти наверняка значит, что вёрстка поменялась или
-        # вместо страницы приехала заглушка - лучше упасть, чем решить, что
+        # пусто почти наверняка значит, что вёрстка поменялась или вместо
+        # страницы приехала заглушка - лучше упасть, чем решить, что
         # "всё удалили", и разослать панику
-        raise RuntimeError(
-            f"по селектору '{watcher['selector']}' не найдено ни одной ссылки - "
-            "возможно, изменилась вёрстка страницы"
-        )
+        raise RuntimeError(f"{empty_error} - возможно, изменилась вёрстка страницы")
 
     prev_items = watcher_state.get("items")
     if prev_items is None:
         watcher_state["items"] = items
-        log.info("[%s] Инициализация: %s ссылок", watcher["title"], len(items))
-        return
+        log.info("[%s] Инициализация: %s %s", watcher["title"], len(items), unit)
+        return True
 
-    parts = diff_page_items(prev_items, items)
+    parts = diff(prev_items, items)
     if not parts:
-        log.info("[%s] Без изменений (%s ссылок)", watcher["title"], len(items))
-        watcher_state["items"] = items
-        return
+        log.info("[%s] Без изменений (%s %s)", watcher["title"], len(items), unit)
+        return False
 
     log.info("[%s] Изменений: %s", watcher["title"], len(parts))
-    for kind, header in PAGE_DIFF_GROUPS:
-        group = [p for p in parts if p["kind"] == kind]
+    for group_kind, header in groups:
+        group = [p for p in parts if p["kind"] == group_kind]
         if not group:
             continue
-        tg_send(
-            f"🔔 {header}: {len(group)}\n{watcher['title']}\n{watcher['url']}\n\n"
-            f"{format_diff(group)}"
-        )
+        body = "\n\n".join(p["text"] for p in group) if full_text else format_diff(group)
+        tg_send(f"🔔 {header}: {len(group)}\n{watcher['title']}\n{page_url}\n\n{body}")
 
     watcher_state["items"] = items
+    return True
 
 
 def current_page_slot(now=None):
@@ -650,8 +801,9 @@ def main():
         registries_state = state.setdefault("registries", {})
         for i, registry_id in enumerate(REGISTRY_IDS):
             registry_state = registries_state.setdefault(registry_id, {})
+            changed = False
             try:
-                check_registry(registry_id, registry_state)
+                changed = check_registry(registry_id, registry_state)
                 if consecutive_errors[registry_id] >= ERROR_ALERT_THRESHOLD:
                     tg_send(f"✅ Реестр снова доступен, проверки восстановлены:\n{registry_id}")
                 consecutive_errors[registry_id] = 0
@@ -670,7 +822,12 @@ def main():
                     except Exception:  # noqa: BLE001
                         log.exception("И в Telegram написать тоже не вышло")
             finally:
-                save_state(state)
+                # Пишем файл состояния только когда там правда что-то
+                # поменялось. В покое реестры не меняются неделями, а файл
+                # весит мегабайты - переписывать его вхолостую каждые
+                # полторы минуты незачем.
+                if changed:
+                    save_state(state)
             if i < len(REGISTRY_IDS) - 1:
                 time.sleep(REQUEST_DELAY)
 
@@ -706,8 +863,8 @@ def main():
                     except Exception:  # noqa: BLE001
                         log.exception("И в Telegram написать тоже не вышло")
                 if page_errors[watcher["key"]] >= ERROR_ALERT_THRESHOLD:
-                    # Про поломку уже сообщили - перестаём долбить сайт каждые
-                    # три минуты и ждём следующего назначенного часа.
+                    # Про поломку уже сообщили - перестаём долбить сайт
+                    # каждый цикл и ждём следующего назначенного часа.
                     watcher_state["slot"] = slot
                     log.warning(
                         "[%s] Пропускаем до следующей проверки по расписанию",
