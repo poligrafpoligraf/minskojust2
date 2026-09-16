@@ -160,10 +160,46 @@ NOTE_LIMIT = 1500  # чтобы случайно вставленная прос
 # СНИЛС, номера счетов и т.п.). API их отдаёт, но сообщения становятся длинными.
 SHOW_HIDDEN_FIELDS = os.environ.get("SHOW_HIDDEN_FIELDS", "false").strip().lower() in ("1", "true", "yes", "on")
 
-# Прокси не обязателен. Оставьте PROXY_URL пустым, чтобы ходить напрямую.
-# Формат: http://user:pass@host:port  или  socks5://user:pass@host:port
-PROXY_URL = os.environ.get("PROXY_URL")
-PROXIES = {"http": PROXY_URL, "https": PROXY_URL} if PROXY_URL else None
+# ---------------------------------------------------------------------------
+# Прокси: список с переключением при отказе
+# ---------------------------------------------------------------------------
+# Задаются переменными окружения PROXY_URL, PROXY_URL_2, PROXY_URL_3 и так
+# далее по порядку. Формат каждой:
+#     http://логин:пароль@адрес:порт   или   socks5://логин:пароль@адрес:порт
+# Рядом можно (необязательно) положить дату окончания оплаты - бот напомнит
+# заранее:  PROXY_1_EXPIRES=2026-09-25, PROXY_2_EXPIRES=2026-12-16 и т.д.
+#
+# Порядок важен: первый в списке считается основным, к нему бот старается
+# вернуться. Остальные - резерв на случай отказа.
+#
+# Прокси вообще не обязателен: если ни одной переменной нет, ходим напрямую.
+PROXY_EXPIRY_WARN_DAYS = int(os.environ.get("PROXY_EXPIRY_WARN_DAYS", "5"))
+# Как часто пробовать вернуться на основной прокси, если сидим на резервном.
+PROXY_RETURN_INTERVAL = float(os.environ.get("PROXY_RETURN_INTERVAL_SECONDS", str(30 * 60)))
+
+
+def load_proxies():
+    proxies = []
+    for i in range(1, 10):
+        name = "PROXY_URL" if i == 1 else f"PROXY_URL_{i}"
+        url = (os.environ.get(name) or "").strip()
+        if not url:
+            continue
+        proxies.append({
+            "n": i,
+            "url": url,
+            "expires": (os.environ.get(f"PROXY_{i}_EXPIRES") or "").strip() or None,
+        })
+    return proxies
+
+
+PROXY_LIST = load_proxies()
+
+
+def proxy_label(proxy):
+    """Как называть прокси в сообщениях - без логина и пароля."""
+    host = proxy["url"].split("@")[-1]
+    return f"прокси №{proxy['n']} ({host})"
 
 # reestrs.minjust.gov.ru отдаёт неполную цепочку сертификатов: присылает свой
 # сертификат, но не промежуточный. Браузеры это молча чинят (докачивают
@@ -226,6 +262,252 @@ def split_message(text):
     return chunks
 
 
+# ---------------------------------------------------------------------------
+# Переключение прокси при отказе
+# ---------------------------------------------------------------------------
+
+class ProxyPool:
+    """Держит список прокси и помнит, через какой сейчас ходим.
+
+    Если запрос не прошёл по сетевой причине - пробуем следующий. Про каждое
+    переключение сообщаем в Telegram: иначе прокси будут тихо умирать один за
+    другим, бот продолжит бодро работать, и в тот день, когда кончится
+    последний, всё встанет разом и без предупреждения."""
+
+    def __init__(self, proxies):
+        self.proxies = proxies
+        self.index = 0
+        self.returned_at = time.time()
+        # О каком прокси уже сообщили, что он лёг. Нужно, чтобы не слать
+        # одно и то же сообщение каждые полчаса, пока он не починится.
+        self.reported_dead = set()
+
+    def enabled(self):
+        return bool(self.proxies)
+
+    def current(self):
+        return self.proxies[self.index] if self.proxies else None
+
+    def as_requests_dict(self):
+        proxy = self.current()
+        if not proxy:
+            return None
+        return {"http": proxy["url"], "https": proxy["url"]}
+
+    def maybe_return_to_main(self):
+        """Периодически возвращаемся на основной прокси: вдруг ожил."""
+        if self.index == 0 or not self.proxies:
+            return
+        if time.time() - self.returned_at < PROXY_RETURN_INTERVAL:
+            return
+        log.info("Пробуем вернуться на основной прокси")
+        self.index = 0
+        self.returned_at = time.time()
+
+    def _say(self, text):
+        try:
+            tg_send(text)
+        except Exception:  # noqa: BLE001
+            log.exception("Не удалось отправить сообщение про прокси")
+
+    def mark_success(self):
+        """Запрос через текущий прокси прошёл. Если мы про него писали, что
+        он лёг, - сообщаем, что ожил, и снимаем пометку."""
+        proxy = self.current()
+        if proxy and proxy["n"] in self.reported_dead:
+            self.reported_dead.discard(proxy["n"])
+            self._say(f"✅ {proxy_label(proxy)} снова работает.")
+
+    def switch_after_failure(self, error):
+        """Переходит на следующий прокси в списке."""
+        if len(self.proxies) < 2:
+            return
+        failed = self.current()
+        self.index = (self.index + 1) % len(self.proxies)
+        nxt = self.current()
+        log.warning("%s не отвечает (%s), перехожу на %s", proxy_label(failed), error, proxy_label(nxt))
+
+        # Сообщаем только про первый отказ этого прокси. Иначе, пока он лежит,
+        # бот будет слать одно и то же каждые полчаса - при каждой попытке
+        # вернуться на основной.
+        if failed["n"] in self.reported_dead:
+            return
+        self.reported_dead.add(failed["n"])
+        alive = len(self.proxies) - len(self.reported_dead)
+        self._say(
+            f"🔁 {proxy_label(failed)} не отвечает, перешёл на {proxy_label(nxt)}.\n"
+            f"Рабочих прокси осталось: {alive} из {len(self.proxies)}.\n\n{error}"
+        )
+
+
+POOL = ProxyPool(PROXY_LIST)
+
+# Ошибки, при которых виноват скорее прокси, чем сайт: до сайта вообще не
+# доехали. HTTP-коды и разбор страницы сюда не относятся - при них менять
+# прокси бессмысленно.
+NETWORK_ERRORS = (
+    requests.exceptions.ProxyError,
+    requests.exceptions.ConnectTimeout,
+    requests.exceptions.ConnectionError,
+    requests.exceptions.ReadTimeout,
+)
+
+
+def request_via_proxy(method, url, **kwargs):
+    """requests.request, но с перебором прокси при сетевых отказах."""
+    if not POOL.enabled():
+        return requests.request(method, url, proxies=None, **kwargs)
+
+    attempts = len(POOL.proxies)
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            response = requests.request(method, url, proxies=POOL.as_requests_dict(), **kwargs)
+        except NETWORK_ERRORS as e:
+            last_error = e
+            # Перебираем ровно по разу каждый прокси из списка: переключаемся
+            # после каждой неудачи, кроме последней попытки.
+            if attempt < attempts - 1:
+                POOL.switch_after_failure(e)
+            continue
+        POOL.mark_success()
+        return response
+    raise last_error
+
+
+# ---------------------------------------------------------------------------
+# Кто сейчас сломан и о чём мы уже сообщали
+# ---------------------------------------------------------------------------
+# Как часто напоминать о поломке, которую до сих пор не починили.
+REMINDER_INTERVAL = float(os.environ.get("PROBLEM_REMINDER_SECONDS", str(6 * 3600)))
+
+
+def human_duration(seconds):
+    seconds = int(seconds)
+    if seconds < 3600:
+        return f"{seconds // 60} мин"
+    if seconds < 86400:
+        return f"{seconds // 3600} ч {(seconds % 3600) // 60} мин"
+    return f"{seconds // 86400} дн {(seconds % 86400) // 3600} ч"
+
+
+class Problems:
+    """Решает, о чём писать в Telegram, а о чём промолчать.
+
+    Правила, чтобы не спамить:
+
+    1. Единичный сбой - молчим, только в лог. Сеть иногда моргает, и писать
+       об этом людям незачем.
+    2. Источник не отвечает N раз подряд (ERROR_ALERT_THRESHOLD) - одно
+       сообщение про этот источник.
+    3. Если в одном цикле легли ВСЕ проверяемые источники - это не про них,
+       а про связь. Тогда уходит ОДНО общее сообщение вместо семи отдельных,
+       а частные жалобы гасим.
+    4. Пока не починилось - напоминание раз в REMINDER_INTERVAL, с указанием,
+       сколько это уже длится. Молчать нельзя: тишина неотличима от порядка.
+    5. Починилось - одно сообщение, тоже с длительностью простоя.
+    """
+
+    def __init__(self):
+        self.streak = {}   # источник -> сколько неудач подряд
+        self.active = {}   # проблема -> {since, last_alert, label}
+        self.cycle = []    # что проверяли в текущем цикле
+
+    def ok(self, key, title):
+        self.cycle.append((key, title, None))
+
+    def failed(self, key, title, error):
+        self.cycle.append((key, title, error))
+
+    # -- внутреннее --------------------------------------------------------
+
+    def notify(self, text):
+        """Отправить сообщение, не роняя бота, если Telegram не ответил."""
+        try:
+            tg_send(text)
+        except Exception:  # noqa: BLE001
+            log.exception("Не удалось отправить сообщение о поломке")
+
+    _say = notify  # прежнее имя, используется внутри класса
+
+    def _raise(self, pid, label, error, fixed_label=None):
+        now = time.time()
+        problem = self.active.get(pid)
+        if problem is None:
+            self.active[pid] = {
+                "since": now,
+                "last_alert": now,
+                "label": label,
+                "fixed": fixed_label or f"снова отвечает: {label}",
+            }
+            self._say(f"⚠️ {label}\n\n{error}")
+            return
+        if now - problem["last_alert"] >= REMINDER_INTERVAL:
+            problem["last_alert"] = now
+            self._say(
+                f"⚠️ Всё ещё не работает: {label}\n"
+                f"Длится уже {human_duration(now - problem['since'])}.\n\n{error}"
+            )
+
+    def _resolve(self, pid):
+        problem = self.active.pop(pid, None)
+        if problem:
+            self._say(
+                f"✅ Починилось — {problem['fixed']}.\n"
+                f"Не работало {human_duration(time.time() - problem['since'])}."
+            )
+
+    def _forget(self, pid):
+        self.active.pop(pid, None)
+
+    # -- итог цикла --------------------------------------------------------
+
+    def end_cycle(self):
+        checked, self.cycle = self.cycle, []
+        if not checked:
+            return
+
+        for key, _title, error in checked:
+            self.streak[key] = 0 if error is None else self.streak.get(key, 0) + 1
+
+        failed = [(k, t, e) for k, t, e in checked if e is not None]
+        everything_down = (
+            len(failed) == len(checked)
+            and len(checked) >= 2
+            and all(self.streak[k] >= ERROR_ALERT_THRESHOLD for k, _, _ in failed)
+        )
+
+        if everything_down:
+            # Не отвечает вообще ничего - значит дело не в сайтах, а в связи
+            # или прокси. Одно сообщение вместо пачки одинаковых.
+            where = f" (сейчас через {proxy_label(POOL.current())})" if POOL.enabled() else ""
+            self._raise(
+                "infra",
+                f"Ни один источник не отвечает{where}",
+                failed[0][2],
+                fixed_label="связь восстановлена, источники снова отвечают",
+            )
+            for key, _title, _error in failed:
+                self._forget(f"src:{key}")
+            return
+
+        self._resolve("infra")
+        for key, title, error in checked:
+            pid = f"src:{key}"
+            if error is None:
+                self._resolve(pid)
+            elif self.streak[key] >= ERROR_ALERT_THRESHOLD:
+                self._raise(
+                    pid,
+                    f"Не отвечает: {title}",
+                    error,
+                    fixed_label=f"снова отвечает {title}",
+                )
+
+
+PROBLEMS = Problems()
+
+
 def load_state():
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
@@ -243,10 +525,10 @@ def save_state(state):
 
 
 def fetch_info(registry_id):
-    r = requests.get(
+    r = request_via_proxy(
+        "GET",
         f"{BASE}/rest/registry/{registry_id}/info",
         headers={"accept": "application/json"},
-        proxies=PROXIES,
         verify=VERIFY_SSL,
         timeout=20,
     )
@@ -265,11 +547,11 @@ def fetch_rows(registry_id):
     total = None
 
     while True:
-        r = requests.post(
+        r = request_via_proxy(
+            "POST",
             f"{BASE}/rest/registry/{registry_id}/values",
             json={"limit": PAGE_SIZE, "offset": offset},
             headers={"accept": "application/json"},
-            proxies=PROXIES,
             verify=VERIFY_SSL,
             timeout=30,
         )
@@ -524,19 +806,41 @@ def page_item_key(href, text):
     return (href or "").strip() or (text or "").strip()
 
 
-def fetch_soup(url, encoding=None):
-    """Скачивает страницу и отдаёт разобранный HTML."""
-    r = requests.get(
+def fetch_soup(url, encoding=None, validators=None):
+    """Скачивает страницу и отдаёт (разобранный HTML, метки версии).
+
+    Если передать `validators` - метки, полученные при прошлом скачивании, -
+    запрос уходит с вопросом «отдай, только если изменилось». Когда страница
+    не менялась, сервер отвечает пустым 304 вместо всего документа, и мы
+    возвращаем (None, те же метки). Для страницы ФСБ это 70 килобайт против
+    пары сотен байт на каждой проверке.
+
+    Сервер может этого не уметь - тогда он просто продолжит отдавать всё
+    целиком, и ничего не сломается."""
+    headers = {
+        "accept": "text/html,application/xhtml+xml",
+        # без внятного User-Agent некоторые сайты отдают заглушку
+        "user-agent": "Mozilla/5.0 (compatible; reestr-watch-bot/1.0)",
+    }
+    if validators:
+        if validators.get("last_modified"):
+            headers["if-modified-since"] = validators["last_modified"]
+        if validators.get("etag"):
+            headers["if-none-match"] = validators["etag"]
+
+    r = request_via_proxy(
+        "GET",
         url,
-        headers={
-            "accept": "text/html,application/xhtml+xml",
-            # без внятного User-Agent некоторые сайты отдают заглушку
-            "user-agent": "Mozilla/5.0 (compatible; reestr-watch-bot/1.0)",
-        },
-        proxies=PROXIES,
+        headers=headers,
         verify=VERIFY_SSL,
         timeout=30,
     )
+
+    # 304 = "с прошлого раза не менялось". Тела в ответе нет и разбирать
+    # нечего - отдаём прежние метки, чтобы и дальше ими спрашивать.
+    if r.status_code == 304:
+        return None, validators
+
     r.raise_for_status()
 
     # Некоторые сайты не сообщают кодировку в заголовке, а requests в таком
@@ -544,12 +848,16 @@ def fetch_soup(url, encoding=None):
     if encoding:
         r.encoding = encoding
 
-    return BeautifulSoup(r.text, "html.parser")
+    fresh = {
+        "last_modified": r.headers.get("Last-Modified"),
+        "etag": r.headers.get("ETag"),
+    }
+    supported = bool(fresh["last_modified"] or fresh["etag"])
+    return BeautifulSoup(r.text, "html.parser"), (fresh if supported else None)
 
 
-def fetch_page_items(watcher):
-    """Скачивает страницу и возвращает {ключ: {title, href}} по её ссылкам."""
-    soup = fetch_soup(watcher["url"], watcher.get("encoding"))
+def parse_page_links(watcher, soup):
+    """{ключ: {title, href}} по ссылкам страницы."""
     items = {}
     for a in soup.select(watcher["selector"]):
         text = " ".join(a.get_text().split())
@@ -603,9 +911,28 @@ def parse_all_tables(soup):
     return items
 
 
-def fetch_table_all(watcher):
-    """Весь список с одной страницы."""
-    return parse_all_tables(fetch_soup(watcher["url"], watcher.get("encoding")))
+# Как часто скачивать страницу целиком, даже если сервер уверяет, что она не
+# менялась. Подстраховка: если его метки версии врут или залипли, мы всё
+# равно свежую картину увидим - не позже чем через этот срок.
+FULL_FETCH_INTERVAL = float(os.environ.get("FULL_FETCH_INTERVAL_SECONDS", str(6 * 3600)))
+
+
+def fetch_single_page(watcher, watcher_state):
+    """Скачивает одностраничного наблюдателя, по возможности условным
+    запросом. Возвращает soup либо None, если страница не менялась."""
+    validators = watcher_state.get("http")
+    last_full = watcher_state.get("full_at", 0)
+    if time.time() - last_full > FULL_FETCH_INTERVAL:
+        validators = None  # время для честной полной перекачки
+
+    soup, fresh = fetch_soup(watcher["url"], watcher.get("encoding"), validators)
+
+    if soup is None:
+        return None
+
+    watcher_state["http"] = fresh
+    watcher_state["full_at"] = time.time() if validators is None else last_full
+    return soup
 
 
 def format_org(item, marker):
@@ -663,7 +990,9 @@ def fetch_table_tail(watcher):
     запросов: первая страница - узнать, сколько их всего, и последняя -
     за самими записями."""
     encoding = watcher.get("encoding")
-    first = fetch_soup(watcher["url"], encoding)
+    # Тут условные запросы не используем: страниц две, ходим трижды в сутки,
+    # экономить нечего, а лишняя логика - лишний способ ошибиться.
+    first, _ = fetch_soup(watcher["url"], encoding)
     pages = last_page_number(first)
 
     if pages <= 1:
@@ -672,7 +1001,7 @@ def fetch_table_tail(watcher):
     # пауза между запросами: сайт не любит, когда страницы дёргают подряд
     time.sleep(REQUEST_DELAY)
     separator = "&" if "?" in watcher["url"] else "?"
-    last = fetch_soup(f"{watcher['url']}{separator}page={pages}", encoding)
+    last, _ = fetch_soup(f"{watcher['url']}{separator}page={pages}", encoding)
     return parse_table_rows(last), pages
 
 
@@ -801,7 +1130,12 @@ def check_page_watcher(watcher, watcher_state):
     kind = watcher.get("type", "links")
 
     if kind == "table_all":
-        items = fetch_table_all(watcher)
+        soup = fetch_single_page(watcher, watcher_state)
+        if soup is None:
+            # сервер ответил "не менялось" - разбирать нечего
+            log.info("[%s] Без изменений (страница не менялась, 304)", watcher["title"])
+            return False
+        items = parse_all_tables(soup)
         page_url = watcher["url"]
         diff = diff_org_items
         groups = ORG_DIFF_GROUPS
@@ -819,7 +1153,11 @@ def check_page_watcher(watcher, watcher_state):
         empty_error = "в таблице не найдено ни одной строки"
         unit = "строк"
     else:
-        items = fetch_page_items(watcher)
+        soup = fetch_single_page(watcher, watcher_state)
+        if soup is None:
+            log.info("[%s] Без изменений (страница не менялась, 304)", watcher["title"])
+            return False
+        items = parse_page_links(watcher, soup)
         page_url = watcher["url"]
         diff = diff_page_items
         groups = PAGE_DIFF_GROUPS
@@ -938,20 +1276,40 @@ def startup_message():
     return "\n".join(lines)
 
 
+def check_proxy_expiry(state):
+    """Раз в сутки смотрим на даты окончания прокси и предупреждаем заранее."""
+    today = datetime.now(ZoneInfo(PAGE_CHECK_TZ)).date()
+    if state.get("expiry_checked") == today.isoformat():
+        return
+    state["expiry_checked"] = today.isoformat()
+
+    for proxy in POOL.proxies:
+        if not proxy.get("expires"):
+            continue
+        try:
+            left = (datetime.strptime(proxy["expires"], "%Y-%m-%d").date() - today).days
+        except ValueError:
+            log.warning("Не понимаю дату окончания у прокси №%s: %s", proxy["n"], proxy["expires"])
+            continue
+        if left < 0:
+            PROBLEMS.notify(f"⌛️ {proxy_label(proxy)} просрочен ({proxy['expires']}).")
+        elif left <= PROXY_EXPIRY_WARN_DAYS:
+            PROBLEMS.notify(
+                f"⌛️ {proxy_label(proxy)} заканчивается через {left} дн. "
+                f"({proxy['expires']}). Пора продлевать."
+            )
+
+
 def main():
     log.info(
-        "Старт. Реестров: %s. Получателей в Telegram: %s. Интервал проверки: %s сек. Прокси: %s. Скрытые поля: %s",
+        "Старт. Реестров: %s. Получателей: %s. Интервал: %s сек. Прокси в списке: %s. Скрытые поля: %s",
         len(REGISTRY_IDS),
         len(CHAT_IDS),
         CHECK_INTERVAL,
-        "включен" if PROXY_URL else "выключен (прямое подключение)",
+        len(POOL.proxies) or "нет (прямое подключение)",
         "показываются" if SHOW_HIDDEN_FIELDS else "не показываются",
     )
     state = load_state()
-    # счётчик подряд идущих ошибок отдельно на каждый реестр, чтобы один
-    # упавший реестр не топил алертами остальные и не мешал их проверке
-    consecutive_errors = {rid: 0 for rid in REGISTRY_IDS}
-    page_errors = {w["key"]: 0 for w in PAGE_WATCHERS}
 
     try:
         tg_send(startup_message())
@@ -959,29 +1317,25 @@ def main():
         log.exception("Не удалось отправить стартовое сообщение в Telegram")
 
     while True:
+        # Если сидим на резервном прокси - периодически пробуем вернуться
+        # на основной: вдруг он уже ожил.
+        POOL.maybe_return_to_main()
+        check_proxy_expiry(state)
+
         registries_state = state.setdefault("registries", {})
         for i, registry_id in enumerate(REGISTRY_IDS):
             registry_state = registries_state.setdefault(registry_id, {})
             changed = False
             try:
                 changed = check_registry(registry_id, registry_state)
-                if consecutive_errors[registry_id] >= ERROR_ALERT_THRESHOLD:
-                    tg_send(f"✅ Реестр снова доступен, проверки восстановлены:\n{registry_id}")
-                consecutive_errors[registry_id] = 0
+                PROBLEMS.ok(f"reg:{registry_id}", registry_id)
             except Exception as e:  # noqa: BLE001
-                consecutive_errors[registry_id] += 1
-                log.exception(
-                    "[%s] Ошибка проверки (%s подряд): %s", registry_id, consecutive_errors[registry_id], e
+                log.exception("[%s] Ошибка проверки: %s", registry_id, e)
+                PROBLEMS.failed(
+                    f"reg:{registry_id}",
+                    f"реестр {BASE}/#/registry/{registry_id}",
+                    e,
                 )
-                if consecutive_errors[registry_id] == ERROR_ALERT_THRESHOLD:
-                    try:
-                        tg_send(
-                            f"⚠️ Не получается достучаться до реестра уже "
-                            f"{consecutive_errors[registry_id]} проверки подряд:\n"
-                            f"{BASE}/#/registry/{registry_id}\n{e}"
-                        )
-                    except Exception:  # noqa: BLE001
-                        log.exception("И в Telegram написать тоже не вышло")
             finally:
                 # Пишем файл состояния только когда там правда что-то
                 # поменялось. В покое реестры не меняются неделями, а файл
@@ -1002,41 +1356,32 @@ def main():
             fast = bool(watcher.get("fast"))
             if not fast and (slot is None or watcher_state.get("slot") == slot):
                 continue
+            page_changed = False
             try:
-                check_page_watcher(watcher, watcher_state)
+                page_changed = check_page_watcher(watcher, watcher_state)
                 if not fast:
                     watcher_state["slot"] = slot
-                if page_errors[watcher["key"]] >= ERROR_ALERT_THRESHOLD:
-                    tg_send(f"✅ Страница снова доступна, проверки восстановлены:\n{watcher['url']}")
-                page_errors[watcher["key"]] = 0
+                    page_changed = True  # отметку о проверке надо сохранить
+                PROBLEMS.ok(f"page:{watcher['key']}", watcher["title"])
             except Exception as e:  # noqa: BLE001
-                page_errors[watcher["key"]] += 1
-                log.exception(
-                    "[%s] Ошибка проверки страницы (%s подряд): %s",
-                    watcher["title"],
-                    page_errors[watcher["key"]],
-                    e,
-                )
-                if page_errors[watcher["key"]] == ERROR_ALERT_THRESHOLD:
-                    try:
-                        tg_send(
-                            f"⚠️ Не получается проверить страницу уже "
-                            f"{page_errors[watcher['key']]} раза подряд:\n"
-                            f"{watcher['url']}\n{e}"
-                        )
-                    except Exception:  # noqa: BLE001
-                        log.exception("И в Telegram написать тоже не вышло")
-                if not fast and page_errors[watcher["key"]] >= ERROR_ALERT_THRESHOLD:
+                log.exception("[%s] Ошибка проверки страницы: %s", watcher["title"], e)
+                PROBLEMS.failed(f"page:{watcher['key']}", watcher["title"], e)
+                if not fast and PROBLEMS.streak.get(f"page:{watcher['key']}", 0) >= ERROR_ALERT_THRESHOLD:
                     # Про поломку уже сообщили - перестаём долбить сайт
                     # каждый цикл и ждём следующего назначенного часа.
                     watcher_state["slot"] = slot
-                    log.warning(
-                        "[%s] Пропускаем до следующей проверки по расписанию",
-                        watcher["title"],
-                    )
+                    page_changed = True
+                    log.warning("[%s] Пропускаем до следующей проверки по расписанию", watcher["title"])
             finally:
-                save_state(state)
+                # Как и с реестрами: пишем файл, только если есть что писать.
+                # Иначе быстрый наблюдатель за ФСБ заставлял бы переписывать
+                # многомегабайтный state.json каждые полторы минуты.
+                if page_changed:
+                    save_state(state)
             time.sleep(REQUEST_DELAY)
+
+        # Разбор итогов цикла: решаем, о чём писать людям, а о чём смолчать.
+        PROBLEMS.end_cycle()
 
         time.sleep(CHECK_INTERVAL)
 
