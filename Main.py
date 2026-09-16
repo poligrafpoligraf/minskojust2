@@ -107,6 +107,29 @@ PAGE_WATCHERS = [
         "url": "https://minjust.gov.ru/ru/extremist-materials/",
         "encoding": "utf-8",
     },
+    {
+        # Единый федеральный список террористических организаций (ФСБ).
+        # Весь список на одной странице, поэтому тут, в отличие от списка
+        # материалов, честно ловятся и исключения, и правки.
+        #
+        # ВАЖНО про вёрстку: пункты 1-72 лежат в одной большой таблице, а
+        # каждый следующий добавлен ОТДЕЛЬНОЙ таблицей на одну строку -
+        # видимо, руками дописывают новый кусок вёрстки. Поэтому разбираем
+        # строки ВСЕХ таблиц страницы: если брать только самую большую,
+        # бот не увидит ни нынешние 73-77, ни любое будущее пополнение.
+        #
+        # Сайт работает только по http и на https отвечает редиректом
+        # обратно на http. Браузеры из-за этого ругаются, requests - нет.
+        #
+        # "fast": True - проверять каждый цикл вместе с реестрами, а не по
+        # расписанию 9/14/22, как остальные страницы.
+        "key": "fsb_terror_orgs",
+        "type": "table_all",
+        "title": "Единый федеральный список террористических организаций (ФСБ)",
+        "url": "http://www.fsb.ru/fsb/npd/terror.htm",
+        "encoding": "utf-8",
+        "fast": True,
+    },
 ]
 
 # Страницы проверяем не по таймеру, а в заданные часы по местному времени:
@@ -119,6 +142,19 @@ PAGE_CHECK_HOURS = [
 # Europe/Berlin - это CET зимой и CEST летом, то есть "9 утра" остаётся
 # девятью утра по стенным часам круглый год.
 PAGE_CHECK_TZ = os.environ.get("PAGE_CHECK_TZ", "Europe/Berlin")
+
+# Записка от человека, которая попадает в сообщение о перезапуске бота.
+# Лежит в обычном текстовом файле note.txt рядом со скриптом: пишете туда
+# пару строк, коммитите вместе с остальными правками - и при следующем
+# запуске они уедут всем получателям. Строки, начинающиеся с #, считаются
+# пояснением к самому файлу и не отправляются. Пустой файл (или его
+# отсутствие) = никакой записки в сообщении не будет.
+NOTE_FILE = os.environ.get("NOTE_FILE", "note.txt")
+# Если лезть в git ради одной записки не хочется - то же самое можно
+# положить в переменную STARTUP_NOTE на Railway: она главнее файла, а само
+# её сохранение уже вызывает передеплой, то есть записка уедет сразу.
+STARTUP_NOTE = os.environ.get("STARTUP_NOTE", "")
+NOTE_LIMIT = 1500  # чтобы случайно вставленная простыня не разнесла сообщение
 
 # Показывать ли поля, которые скрыты в таблице на сайте (дата рождения, ИНН,
 # СНИЛС, номера счетов и т.п.). API их отдаёт, но сообщения становятся длинными.
@@ -552,6 +588,74 @@ def parse_table_rows(soup):
     return items
 
 
+def parse_all_tables(soup):
+    """Строки ВСЕХ таблиц страницы, у которых в первой ячейке номер.
+
+    Именно всех, а не самой большой: на странице ФСБ свежие пункты добавлены
+    отдельными таблицами на одну строку."""
+    items = {}
+    for tr in soup.select("table tr"):
+        cells = [" ".join(td.get_text().split()) for td in tr.find_all("td")]
+        if len(cells) < 3 or not re.fullmatch(r"\d{1,4}", cells[0]):
+            continue
+        num = int(cells[0])
+        items[f"n{num}"] = {"num": num, "name": cells[1], "court": cells[2]}
+    return items
+
+
+def fetch_table_all(watcher):
+    """Весь список с одной страницы."""
+    return parse_all_tables(fetch_soup(watcher["url"], watcher.get("encoding")))
+
+
+def format_org(item, marker):
+    """Сообщение про одну организацию: номер, наименование целиком, решение."""
+    lines = [f"{marker} №{item['num']}", item.get("name") or "(без наименования)"]
+    if item.get("court"):
+        lines.append("")
+        lines.append(f"Решение: {item['court']}")
+    return "\n".join(lines)
+
+
+def diff_org_items(old, new):
+    """Что изменилось в списке организаций. Тут страница одна и видна
+    целиком, поэтому исключения и правки ловятся честно."""
+    parts = []
+
+    for key, item in sorted(new.items(), key=lambda kv: kv[1]["num"]):
+        if key not in old:
+            parts.append({
+                "kind": "added",
+                "title": f"№{item['num']}",
+                "text": format_org(item, "➕ НОВАЯ ОРГАНИЗАЦИЯ"),
+            })
+
+    for key, item in sorted(old.items(), key=lambda kv: kv[1]["num"]):
+        if key not in new:
+            parts.append({
+                "kind": "removed",
+                "title": f"№{item['num']}",
+                "text": format_org(item, "➖ ОРГАНИЗАЦИЯ ИСКЛЮЧЕНА"),
+            })
+
+    for key, item in sorted(new.items(), key=lambda kv: kv[1]["num"]):
+        was = old.get(key)
+        if not was:
+            continue
+        changes = []
+        for field, label in (("name", "наименование"), ("court", "решение")):
+            if was.get(field) != item.get(field):
+                changes.append(f"  {label}:\n    было: {was.get(field)}\n    стало: {item.get(field)}")
+        if changes:
+            parts.append({
+                "kind": "changed",
+                "title": f"№{item['num']}",
+                "text": f"✏️ ЗАПИСЬ ИЗМЕНЕНА №{item['num']}\n" + "\n".join(changes),
+            })
+
+    return parts
+
+
 def fetch_table_tail(watcher):
     """Забирает последнюю страницу постраничной таблицы.
 
@@ -685,12 +789,26 @@ TABLE_DIFF_GROUPS = (
     ("changed", "✏️ Материалы изменены"),
 )
 
+ORG_DIFF_GROUPS = (
+    ("added", "➕ Новые организации в списке"),
+    ("removed", "➖ Организации исключены из списка"),
+    ("changed", "✏️ Записи изменены"),
+)
+
 
 def check_page_watcher(watcher, watcher_state):
     """Проверяет одну страницу. Первый раз - молча запоминает содержимое."""
     kind = watcher.get("type", "links")
 
-    if kind == "table_tail":
+    if kind == "table_all":
+        items = fetch_table_all(watcher)
+        page_url = watcher["url"]
+        diff = diff_org_items
+        groups = ORG_DIFF_GROUPS
+        full_text = True
+        empty_error = "в таблицах не найдено ни одной пронумерованной строки"
+        unit = "организаций"
+    elif kind == "table_tail":
         items, pages = fetch_table_tail(watcher)
         page_url = f"{watcher['url']}{'&' if '?' in watcher['url'] else '?'}page={pages}"
         diff = diff_table_items
@@ -752,13 +870,48 @@ def current_page_slot(now=None):
     return slot.strftime("%Y-%m-%dT%H")
 
 
+def read_note():
+    """Записка от человека для сообщения о перезапуске.
+
+    Сначала смотрим переменную STARTUP_NOTE, потом файл note.txt. Строки,
+    начинающиеся с #, выкидываем - в них в файле лежит инструкция, как им
+    пользоваться. Если записки нет, возвращаем None, и в сообщении просто
+    не будет соответствующего блока."""
+    raw = STARTUP_NOTE
+    if not raw.strip():
+        try:
+            with open(NOTE_FILE, encoding="utf-8") as f:
+                raw = f.read()
+        except FileNotFoundError:
+            return None
+        except OSError:
+            log.exception("Не удалось прочитать файл записки %s", NOTE_FILE)
+            return None
+
+    lines = [line for line in raw.splitlines() if not line.lstrip().startswith("#")]
+    note = "\n".join(lines).strip()
+    if not note:
+        return None
+    if len(note) > NOTE_LIMIT:
+        note = note[:NOTE_LIMIT].rstrip() + "…"
+    return note
+
+
 def startup_message():
     """Собирает стартовое сообщение со списком названий реестров (не ID) -
     названия берём тем же запросом /info, которым бот и так пользуется для
     проверок. Если у какого-то реестра не получилось получить название
     (например, сайт на секунду недоступен) - показываем его ID, чтобы не
     ронять всё сообщение целиком."""
-    lines = ["✅ Бот обновлён и перезапущен. Следит за реестрами:"]
+    lines = []
+
+    # Записка от человека идёт первой: это то, ради чего сообщение и читают.
+    note = read_note()
+    if note:
+        lines.append(f"📝 {note}")
+        lines.append("—" * 10)
+
+    lines.append("✅ Бот обновлён и перезапущен. Следит за реестрами:")
     for registry_id in REGISTRY_IDS:
         try:
             title = fetch_info(registry_id).get("title") or registry_id
@@ -767,10 +920,18 @@ def startup_message():
             title = registry_id
         lines.append(f"• {title}")
 
-    if PAGE_WATCHERS:
+    fast_pages = [w for w in PAGE_WATCHERS if w.get("fast")]
+    scheduled_pages = [w for w in PAGE_WATCHERS if not w.get("fast")]
+
+    if fast_pages:
+        lines.append("\nИ за страницами - так же часто, как за реестрами:")
+        for watcher in fast_pages:
+            lines.append(f"• {watcher['title']}")
+
+    if scheduled_pages:
         hours = ", ".join(f"{h}:00" for h in sorted(PAGE_CHECK_HOURS))
-        lines.append(f"\nИ за страницами (проверка в {hours} по {PAGE_CHECK_TZ}):")
-        for watcher in PAGE_WATCHERS:
+        lines.append(f"\nА за этими - в {hours} по {PAGE_CHECK_TZ}:")
+        for watcher in scheduled_pages:
             lines.append(f"• {watcher['title']}")
 
     lines.append(f"\nПолучателей: {len(CHAT_IDS)}. Интервал проверки реестров: {CHECK_INTERVAL} сек.")
@@ -831,17 +992,20 @@ def main():
             if i < len(REGISTRY_IDS) - 1:
                 time.sleep(REQUEST_DELAY)
 
-        # Страницы - по расписанию, а не каждый цикл. Если с прошлой проверки
-        # наступил новый назначенный час, обходим их один раз.
+        # Страницы: помеченные "fast" проверяем каждый цикл, вместе с
+        # реестрами, остальные - только когда наступил очередной назначенный
+        # час из PAGE_CHECK_HOURS.
         slot = current_page_slot()
         pages_state = state.setdefault("pages", {})
         for watcher in PAGE_WATCHERS:
             watcher_state = pages_state.setdefault(watcher["key"], {})
-            if slot is None or watcher_state.get("slot") == slot:
+            fast = bool(watcher.get("fast"))
+            if not fast and (slot is None or watcher_state.get("slot") == slot):
                 continue
             try:
                 check_page_watcher(watcher, watcher_state)
-                watcher_state["slot"] = slot
+                if not fast:
+                    watcher_state["slot"] = slot
                 if page_errors[watcher["key"]] >= ERROR_ALERT_THRESHOLD:
                     tg_send(f"✅ Страница снова доступна, проверки восстановлены:\n{watcher['url']}")
                 page_errors[watcher["key"]] = 0
@@ -862,7 +1026,7 @@ def main():
                         )
                     except Exception:  # noqa: BLE001
                         log.exception("И в Telegram написать тоже не вышло")
-                if page_errors[watcher["key"]] >= ERROR_ALERT_THRESHOLD:
+                if not fast and page_errors[watcher["key"]] >= ERROR_ALERT_THRESHOLD:
                     # Про поломку уже сообщили - перестаём долбить сайт
                     # каждый цикл и ждём следующего назначенного часа.
                     watcher_state["slot"] = slot
