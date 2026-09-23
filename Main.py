@@ -221,22 +221,35 @@ log = logging.getLogger("reestr-watch")
 TG_LIMIT = 3900  # запас к телеграмному лимиту в 4096 символов
 
 
-def tg_send(text):
-    """Шлёт сообщение всем получателям из CHAT_IDS, при необходимости разбивая
-    длинный текст на части. Если для одного получателя отправка не удалась
-    (например, он ещё не написал боту /start), это не мешает отправить
-    остальным - ошибка просто попадёт в лог."""
+# Подписавшиеся по паролю. Живут в файле состояния и добавляются к постоянным
+# получателям из CHAT_IDS. Заполняется при загрузке состояния.
+DYNAMIC_CHAT_IDS = {}
+
+
+def all_recipients():
+    """Постоянные получатели плюс подписавшиеся по паролю, без повторов."""
+    return list(dict.fromkeys(CHAT_IDS + sorted(DYNAMIC_CHAT_IDS)))
+
+
+def tg_send_to(chat_id, text):
+    """Одному адресату. Длинный текст режется на части."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    chunks = split_message(text)
-    for chat_id in CHAT_IDS:
+    for chunk in split_message(text):
+        r = requests.post(
+            url,
+            json={"chat_id": chat_id, "text": chunk, "disable_web_page_preview": True},
+            timeout=15,
+        )
+        r.raise_for_status()
+
+
+def tg_send(text):
+    """Шлёт сообщение всем получателям. Если для одного отправка не удалась
+    (например, он заблокировал бота), это не мешает отправить остальным -
+    ошибка просто попадёт в лог."""
+    for chat_id in all_recipients():
         try:
-            for chunk in chunks:
-                r = requests.post(
-                    url,
-                    json={"chat_id": chat_id, "text": chunk, "disable_web_page_preview": True},
-                    timeout=15,
-                )
-                r.raise_for_status()
+            tg_send_to(chat_id, text)
         except Exception:  # noqa: BLE001
             log.exception("Не удалось отправить сообщение получателю %s", chat_id)
 
@@ -260,6 +273,200 @@ def split_message(text):
     if current:
         chunks.append(current)
     return chunks
+
+
+# ---------------------------------------------------------------------------
+# Подписка по паролю
+# ---------------------------------------------------------------------------
+# Человек пишет боту /start, бот просит пароль, человек его вводит - и
+# начинает получать те же уведомления. Не нужно добывать chat_id и вписывать
+# его руками.
+#
+# Пароль задаётся переменной ACCESS_PASSWORD на Railway. Если её нет,
+# подписка выключена совсем и бот ни на что не отвечает - как раньше.
+ACCESS_PASSWORD = (os.environ.get("ACCESS_PASSWORD") or "").strip()
+# Сколько неверных попыток подряд прощаем, прежде чем перестать отвечать.
+PASSWORD_ATTEMPTS = int(os.environ.get("PASSWORD_ATTEMPTS", "5"))
+# И насколько замолкаем для того, кто их исчерпал.
+PASSWORD_LOCKOUT = float(os.environ.get("PASSWORD_LOCKOUT_SECONDS", str(3600)))
+
+HELP_TEXT = (
+    "Это бот-наблюдатель за реестрами Минюста, списком экстремистских "
+    "материалов и списком террористических организаций ФСБ.\n\n"
+    "Чтобы получать уведомления, пришлите пароль одним сообщением.\n"
+    "Отписаться потом - командой /stop."
+)
+
+
+def is_owner(chat_id):
+    """Постоянные получатели (вписанные в код и переменные) - хозяева бота.
+    Им приходят сообщения о том, кто подписался, и доступна команда /who."""
+    return str(chat_id) in CHAT_IDS
+
+
+def notify_owners(text):
+    for chat_id in CHAT_IDS:
+        try:
+            tg_send_to(chat_id, text)
+        except Exception:  # noqa: BLE001
+            log.exception("Не удалось уведомить хозяина %s", chat_id)
+
+
+def describe_user(user):
+    """Имя человека для сообщений: «Имя Фамилия (@username)»."""
+    parts = " ".join(filter(None, [user.get("first_name"), user.get("last_name")])).strip()
+    username = user.get("username")
+    if parts and username:
+        return f"{parts} (@{username})"
+    return parts or (f"@{username}" if username else "без имени")
+
+
+def handle_message(message, state):
+    """Обрабатывает одно входящее сообщение. Возвращает True, если состояние
+    изменилось и его надо сохранить."""
+    chat = message.get("chat") or {}
+    if chat.get("type") != "private":
+        return False  # в группах ничего не слушаем
+
+    chat_id = str(chat.get("id"))
+    text = (message.get("text") or "").strip()
+    user = message.get("from") or {}
+    who = describe_user(user)
+
+    subscribers = state.setdefault("subscribers", {})
+    attempts = state.setdefault("password_attempts", {})
+
+    if text == "/stop":
+        if chat_id in subscribers:
+            subscribers.pop(chat_id)
+            DYNAMIC_CHAT_IDS.pop(chat_id, None)
+            tg_send_to(chat_id, "Отписал. Чтобы вернуться, пришлите пароль ещё раз.")
+            notify_owners(f"➖ Отписался: {who}")
+            log.info("Отписался %s (%s)", who, chat_id)
+            return True
+        if is_owner(chat_id):
+            tg_send_to(chat_id, "Вы вписаны в настройках бота, отписать себя командой нельзя.")
+        else:
+            tg_send_to(chat_id, "Вы и так не подписаны.")
+        return False
+
+    if text == "/who" and is_owner(chat_id):
+        lines = [f"Постоянных получателей: {len(CHAT_IDS)}"]
+        if subscribers:
+            lines.append(f"\nПодписались по паролю ({len(subscribers)}):")
+            lines += [f"• {info.get('name', '?')} — с {info.get('since', '?')}"
+                      for info in subscribers.values()]
+        else:
+            lines.append("\nПо паролю пока никто не подписывался.")
+        tg_send_to(chat_id, "\n".join(lines))
+        return False
+
+    if chat_id in subscribers or is_owner(chat_id):
+        if text in ("/start", "/help"):
+            tg_send_to(chat_id, "Вы уже получаете уведомления. Отписаться - /stop.")
+        return False
+
+    # Дальше - незнакомец. Считаем неудачные попытки, чтобы пароль нельзя
+    # было подобрать перебором. Блокировка не вечная: через PASSWORD_LOCKOUT
+    # счётчик обнуляется, иначе человек, пять раз опечатавшийся, не смог бы
+    # подписаться уже никогда.
+    record = attempts.get(chat_id) or {}
+    locked_until = record.get("until", 0)
+    if locked_until > time.time():
+        log.warning("Игнорирую %s: попытки пароля исчерпаны", chat_id)
+        return False
+    if locked_until:
+        # Блокировка была и уже истекла - прощаем и начинаем счёт заново.
+        # Важно сбрасывать именно здесь, а не при любой записи: иначе
+        # счётчик обнулялся бы на каждой попытке и перебор не ограничивался.
+        attempts.pop(chat_id, None)
+        record = {}
+
+    if text in ("/start", "/help", ""):
+        tg_send_to(chat_id, HELP_TEXT)
+        return False
+
+    if text == ACCESS_PASSWORD:
+        subscribers[chat_id] = {
+            "name": who,
+            "since": datetime.now(ZoneInfo(PAGE_CHECK_TZ)).strftime("%d.%m.%Y"),
+        }
+        DYNAMIC_CHAT_IDS[chat_id] = True
+        attempts.pop(chat_id, None)
+        tg_send_to(
+            chat_id,
+            "Готово, пароль принят. Теперь вы получаете уведомления об "
+            "изменениях в реестрах.\n\nОтписаться - /stop.",
+        )
+        notify_owners(f"➕ Новый подписчик: {who}")
+        log.info("Подписался %s (%s)", who, chat_id)
+        return True
+
+    count = record.get("count", 0) + 1
+    left = PASSWORD_ATTEMPTS - count
+    if left > 0:
+        attempts[chat_id] = {"count": count}
+        tg_send_to(chat_id, f"Пароль неверный. Осталось попыток: {left}.")
+    else:
+        attempts[chat_id] = {"count": count, "until": time.time() + PASSWORD_LOCKOUT}
+        minutes = int(PASSWORD_LOCKOUT // 60)
+        tg_send_to(chat_id, f"Пароль неверный, попытки исчерпаны. Попробуйте через {minutes} мин.")
+        notify_owners(f"⚠️ {who} исчерпал попытки ввода пароля.")
+    log.warning("Неверный пароль от %s (%s), попытка %s", who, chat_id, count)
+    return True
+
+
+def poll_updates(state, seconds):
+    """Слушает входящие сообщения примерно `seconds` секунд.
+
+    Вместо того чтобы просто спать между проверками реестров, бот проводит
+    это время на длинном опросе Telegram. Так ответ на /start приходит за
+    секунду, а не через полтора цикла, и при этом не нужен отдельный поток
+    со своими сложностями."""
+    if not ACCESS_PASSWORD:
+        time.sleep(seconds)
+        return False
+
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates"
+    deadline = time.time() + seconds
+    changed = False
+
+    while True:
+        left = deadline - time.time()
+        if left <= 0:
+            break
+        try:
+            r = requests.post(
+                url,
+                json={
+                    "offset": state.get("updates_offset", 0),
+                    "timeout": int(min(left, 25)),
+                    "allowed_updates": ["message"],
+                },
+                timeout=min(left, 25) + 10,
+            )
+            r.raise_for_status()
+            updates = r.json().get("result", [])
+        except Exception as e:  # noqa: BLE001
+            # 409 бывает, если тот же бот где-то запущен вторым экземпляром:
+            # Telegram отдаёт входящие только одному слушателю.
+            log.warning("Не удалось получить входящие: %s", e)
+            time.sleep(min(left, 10))
+            continue
+
+        for update in updates:
+            state["updates_offset"] = update["update_id"] + 1
+            changed = True
+            message = update.get("message")
+            if not message:
+                continue
+            try:
+                if handle_message(message, state):
+                    changed = True
+            except Exception:  # noqa: BLE001
+                log.exception("Ошибка обработки входящего сообщения")
+
+    return changed
 
 
 # ---------------------------------------------------------------------------
@@ -1272,7 +1479,11 @@ def startup_message():
         for watcher in scheduled_pages:
             lines.append(f"• {watcher['title']}")
 
-    lines.append(f"\nПолучателей: {len(CHAT_IDS)}. Интервал проверки реестров: {CHECK_INTERVAL} сек.")
+    people = len(all_recipients())
+    tail = f"\nПолучателей: {people}. Интервал проверки реестров: {CHECK_INTERVAL} сек."
+    if ACCESS_PASSWORD:
+        tail += "\nНовые подписчики: /start боту и пароль."
+    lines.append(tail)
     return "\n".join(lines)
 
 
@@ -1310,6 +1521,17 @@ def main():
         "показываются" if SHOW_HIDDEN_FIELDS else "не показываются",
     )
     state = load_state()
+
+    # Поднимаем подписавшихся по паролю из файла состояния.
+    DYNAMIC_CHAT_IDS.update({cid: True for cid in state.get("subscribers", {})})
+    if ACCESS_PASSWORD:
+        log.info(
+            "Подписка по паролю включена. Постоянных получателей: %s, подписавшихся: %s",
+            len(CHAT_IDS),
+            len(DYNAMIC_CHAT_IDS),
+        )
+    else:
+        log.info("Подписка по паролю выключена (нет ACCESS_PASSWORD)")
 
     try:
         tg_send(startup_message())
@@ -1383,7 +1605,10 @@ def main():
         # Разбор итогов цикла: решаем, о чём писать людям, а о чём смолчать.
         PROBLEMS.end_cycle()
 
-        time.sleep(CHECK_INTERVAL)
+        # Паузу между проверками проводим не во сне, а слушая входящие:
+        # так подписка по паролю отвечает сразу, а не через полтора цикла.
+        if poll_updates(state, CHECK_INTERVAL):
+            save_state(state)
 
 
 if __name__ == "__main__":
