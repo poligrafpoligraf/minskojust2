@@ -47,6 +47,22 @@ CHAT_IDS = list(dict.fromkeys(
     EXTRA_CHAT_IDS
     + [cid.strip() for cid in os.environ["TELEGRAM_CHAT_ID"].split(",") if cid.strip()]
 ))
+
+# Кому уходит техническая кухня: «бот перезапущен», поломки и починки,
+# переключения прокси, сроки их оплаты, кто подписался и отписался.
+# Остальные получатели видят только содержательное - изменения в реестрах
+# и записку из note.txt.
+#
+# По умолчанию это тот, кто указан в TELEGRAM_CHAT_ID, то есть владелец
+# бота. Если захочется подстраховаться на случай своего отпуска - можно
+# задать отдельно переменной ADMIN_CHAT_ID (через запятую) и добавить
+# туда кого-то ещё.
+ADMIN_CHAT_IDS = [
+    cid.strip()
+    for cid in os.environ.get("ADMIN_CHAT_ID", os.environ["TELEGRAM_CHAT_ID"]).split(",")
+    if cid.strip()
+]
+
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL_SECONDS", "90"))  # 1,5 минуты по умолчанию
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 ERROR_ALERT_THRESHOLD = int(os.environ.get("ERROR_ALERT_THRESHOLD", "3"))  # алерт в ТГ после N подряд ошибок
@@ -143,12 +159,14 @@ PAGE_CHECK_HOURS = [
 # девятью утра по стенным часам круглый год.
 PAGE_CHECK_TZ = os.environ.get("PAGE_CHECK_TZ", "Europe/Berlin")
 
-# Записка от человека, которая попадает в сообщение о перезапуске бота.
+# Записка от человека - единственное в сообщении о перезапуске, что
+# предназначено людям, поэтому она уходит ВСЕМ получателям отдельным
+# сообщением, а техническая часть - только админам.
 # Лежит в обычном текстовом файле note.txt рядом со скриптом: пишете туда
 # пару строк, коммитите вместе с остальными правками - и при следующем
-# запуске они уедут всем получателям. Строки, начинающиеся с #, считаются
-# пояснением к самому файлу и не отправляются. Пустой файл (или его
-# отсутствие) = никакой записки в сообщении не будет.
+# запуске они уедут. Строки, начинающиеся с #, считаются пояснением к
+# самому файлу и не отправляются. Пустой файл (или его отсутствие) =
+# подписчики при передеплое не увидят вообще ничего.
 NOTE_FILE = os.environ.get("NOTE_FILE", "note.txt")
 # Если лезть в git ради одной записки не хочется - то же самое можно
 # положить в переменную STARTUP_NOTE на Railway: она главнее файла, а само
@@ -243,15 +261,29 @@ def tg_send_to(chat_id, text):
         r.raise_for_status()
 
 
-def tg_send(text):
-    """Шлёт сообщение всем получателям. Если для одного отправка не удалась
+def _broadcast(chat_ids, text, what):
+    """Рассылка списку адресатов. Если для одного отправка не удалась
     (например, он заблокировал бота), это не мешает отправить остальным -
     ошибка просто попадёт в лог."""
-    for chat_id in all_recipients():
+    for chat_id in chat_ids:
         try:
             tg_send_to(chat_id, text)
         except Exception:  # noqa: BLE001
-            log.exception("Не удалось отправить сообщение получателю %s", chat_id)
+            log.exception("Не удалось отправить %s получателю %s", what, chat_id)
+
+
+def tg_send(text):
+    """Содержательное сообщение - всем получателям."""
+    _broadcast(all_recipients(), text, "сообщение")
+
+
+def tg_admin(text):
+    """Техническая кухня - только админам.
+
+    Перезапуски, поломки, переключения прокси, сроки оплаты, кто подписался.
+    Обычным подписчикам это не нужно: они подписались на изменения в
+    реестрах, а не на внутреннюю жизнь бота."""
+    _broadcast(ADMIN_CHAT_IDS, text, "техническое сообщение")
 
 
 def split_message(text):
@@ -298,18 +330,15 @@ HELP_TEXT = (
 )
 
 
-def is_owner(chat_id):
-    """Постоянные получатели (вписанные в код и переменные) - хозяева бота.
-    Им приходят сообщения о том, кто подписался, и доступна команда /who."""
+def is_permanent(chat_id):
+    """Получатель, вписанный в настройки бота (код или TELEGRAM_CHAT_ID).
+    Такого нельзя отписать командой /stop - только правкой настроек."""
     return str(chat_id) in CHAT_IDS
 
 
-def notify_owners(text):
-    for chat_id in CHAT_IDS:
-        try:
-            tg_send_to(chat_id, text)
-        except Exception:  # noqa: BLE001
-            log.exception("Не удалось уведомить хозяина %s", chat_id)
+def is_admin(chat_id):
+    """Админ - тот, кому идёт техническая кухня и доступна команда /who."""
+    return str(chat_id) in ADMIN_CHAT_IDS
 
 
 def describe_user(user):
@@ -341,17 +370,20 @@ def handle_message(message, state):
             subscribers.pop(chat_id)
             DYNAMIC_CHAT_IDS.pop(chat_id, None)
             tg_send_to(chat_id, "Отписал. Чтобы вернуться, пришлите пароль ещё раз.")
-            notify_owners(f"➖ Отписался: {who}")
+            tg_admin(f"➖ Отписался: {who}")
             log.info("Отписался %s (%s)", who, chat_id)
             return True
-        if is_owner(chat_id):
+        if is_permanent(chat_id):
             tg_send_to(chat_id, "Вы вписаны в настройках бота, отписать себя командой нельзя.")
         else:
             tg_send_to(chat_id, "Вы и так не подписаны.")
         return False
 
-    if text == "/who" and is_owner(chat_id):
-        lines = [f"Постоянных получателей: {len(CHAT_IDS)}"]
+    if text == "/who" and is_admin(chat_id):
+        lines = [
+            f"Постоянных получателей: {len(CHAT_IDS)}",
+            f"Админов (получают техническое): {len(ADMIN_CHAT_IDS)}",
+        ]
         if subscribers:
             lines.append(f"\nПодписались по паролю ({len(subscribers)}):")
             lines += [f"• {info.get('name', '?')} — с {info.get('since', '?')}"
@@ -361,7 +393,7 @@ def handle_message(message, state):
         tg_send_to(chat_id, "\n".join(lines))
         return False
 
-    if chat_id in subscribers or is_owner(chat_id):
+    if chat_id in subscribers or is_permanent(chat_id):
         if text in ("/start", "/help"):
             tg_send_to(chat_id, "Вы уже получаете уведомления. Отписаться - /stop.")
         return False
@@ -398,7 +430,7 @@ def handle_message(message, state):
             "Готово, пароль принят. Теперь вы получаете уведомления об "
             "изменениях в реестрах.\n\nОтписаться - /stop.",
         )
-        notify_owners(f"➕ Новый подписчик: {who}")
+        tg_admin(f"➕ Новый подписчик: {who}")
         log.info("Подписался %s (%s)", who, chat_id)
         return True
 
@@ -411,7 +443,7 @@ def handle_message(message, state):
         attempts[chat_id] = {"count": count, "until": time.time() + PASSWORD_LOCKOUT}
         minutes = int(PASSWORD_LOCKOUT // 60)
         tg_send_to(chat_id, f"Пароль неверный, попытки исчерпаны. Попробуйте через {minutes} мин.")
-        notify_owners(f"⚠️ {who} исчерпал попытки ввода пароля.")
+        tg_admin(f"⚠️ {who} исчерпал попытки ввода пароля.")
     log.warning("Неверный пароль от %s (%s), попытка %s", who, chat_id, count)
     return True
 
@@ -477,7 +509,7 @@ class ProxyPool:
     """Держит список прокси и помнит, через какой сейчас ходим.
 
     Если запрос не прошёл по сетевой причине - пробуем следующий. Про каждое
-    переключение сообщаем в Telegram: иначе прокси будут тихо умирать один за
+    переключение сообщаем админам: иначе прокси будут тихо умирать один за
     другим, бот продолжит бодро работать, и в тот день, когда кончится
     последний, всё встанет разом и без предупреждения."""
 
@@ -511,19 +543,13 @@ class ProxyPool:
         self.index = 0
         self.returned_at = time.time()
 
-    def _say(self, text):
-        try:
-            tg_send(text)
-        except Exception:  # noqa: BLE001
-            log.exception("Не удалось отправить сообщение про прокси")
-
     def mark_success(self):
         """Запрос через текущий прокси прошёл. Если мы про него писали, что
         он лёг, - сообщаем, что ожил, и снимаем пометку."""
         proxy = self.current()
         if proxy and proxy["n"] in self.reported_dead:
             self.reported_dead.discard(proxy["n"])
-            self._say(f"✅ {proxy_label(proxy)} снова работает.")
+            tg_admin(f"✅ {proxy_label(proxy)} снова работает.")
 
     def switch_after_failure(self, error):
         """Переходит на следующий прокси в списке."""
@@ -541,7 +567,7 @@ class ProxyPool:
             return
         self.reported_dead.add(failed["n"])
         alive = len(self.proxies) - len(self.reported_dead)
-        self._say(
+        tg_admin(
             f"🔁 {proxy_label(failed)} не отвечает, перешёл на {proxy_label(nxt)}.\n"
             f"Рабочих прокси осталось: {alive} из {len(self.proxies)}.\n\n{error}"
         )
@@ -599,7 +625,9 @@ def human_duration(seconds):
 
 
 class Problems:
-    """Решает, о чём писать в Telegram, а о чём промолчать.
+    """Решает, о чём писать админам, а о чём промолчать.
+
+    Всё это - техническая кухня, обычные подписчики её не видят.
 
     Правила, чтобы не спамить:
 
@@ -629,9 +657,10 @@ class Problems:
     # -- внутреннее --------------------------------------------------------
 
     def notify(self, text):
-        """Отправить сообщение, не роняя бота, если Telegram не ответил."""
+        """Техническое сообщение админам, не роняя бота, если Telegram
+        не ответил."""
         try:
-            tg_send(text)
+            tg_admin(text)
         except Exception:  # noqa: BLE001
             log.exception("Не удалось отправить сообщение о поломке")
 
@@ -1416,12 +1445,12 @@ def current_page_slot(now=None):
 
 
 def read_note():
-    """Записка от человека для сообщения о перезапуске.
+    """Записка от человека - уходит всем получателям при перезапуске.
 
     Сначала смотрим переменную STARTUP_NOTE, потом файл note.txt. Строки,
     начинающиеся с #, выкидываем - в них в файле лежит инструкция, как им
-    пользоваться. Если записки нет, возвращаем None, и в сообщении просто
-    не будет соответствующего блока."""
+    пользоваться. Если записки нет, возвращаем None, и подписчики при
+    перезапуске не увидят вообще ничего."""
     raw = STARTUP_NOTE
     if not raw.strip():
         try:
@@ -1443,20 +1472,13 @@ def read_note():
 
 
 def startup_message():
-    """Собирает стартовое сообщение со списком названий реестров (не ID) -
-    названия берём тем же запросом /info, которым бот и так пользуется для
-    проверок. Если у какого-то реестра не получилось получить название
-    (например, сайт на секунду недоступен) - показываем его ID, чтобы не
-    ронять всё сообщение целиком."""
-    lines = []
+    """Техническая сводка при запуске - ТОЛЬКО админам.
 
-    # Записка от человека идёт первой: это то, ради чего сообщение и читают.
-    note = read_note()
-    if note:
-        lines.append(f"📝 {note}")
-        lines.append("—" * 10)
-
-    lines.append("✅ Бот обновлён и перезапущен. Следит за реестрами:")
+    Названия реестров берём тем же запросом /info, которым бот и так
+    пользуется для проверок. Если у какого-то не получилось получить
+    название (например, сайт на секунду недоступен) - показываем его ID,
+    чтобы не ронять всё сообщение целиком."""
+    lines = ["✅ Бот обновлён и перезапущен. Следит за реестрами:"]
     for registry_id in REGISTRY_IDS:
         try:
             title = fetch_info(registry_id).get("title") or registry_id
@@ -1480,11 +1502,33 @@ def startup_message():
             lines.append(f"• {watcher['title']}")
 
     people = len(all_recipients())
-    tail = f"\nПолучателей: {people}. Интервал проверки реестров: {CHECK_INTERVAL} сек."
+    tail = (
+        f"\nПолучателей: {people} (из них админов: {len(ADMIN_CHAT_IDS)}). "
+        f"Интервал проверки реестров: {CHECK_INTERVAL} сек."
+    )
     if ACCESS_PASSWORD:
         tail += "\nНовые подписчики: /start боту и пароль."
     lines.append(tail)
     return "\n".join(lines)
+
+
+def announce_startup():
+    """При запуске уходит два разных сообщения.
+
+    Записка - всем: это единственное, что адресовано людям. Техническая
+    сводка - только админам: подписчикам незачем знать, что владелец бота
+    выкатил очередную правку."""
+    note = read_note()
+    if note:
+        try:
+            tg_send(f"📝 {note}")
+        except Exception:  # noqa: BLE001
+            log.exception("Не удалось разослать записку")
+
+    try:
+        tg_admin(startup_message())
+    except Exception:  # noqa: BLE001
+        log.exception("Не удалось отправить стартовое сообщение админам")
 
 
 def check_proxy_expiry(state):
@@ -1513,9 +1557,11 @@ def check_proxy_expiry(state):
 
 def main():
     log.info(
-        "Старт. Реестров: %s. Получателей: %s. Интервал: %s сек. Прокси в списке: %s. Скрытые поля: %s",
+        "Старт. Реестров: %s. Получателей: %s (админов: %s). Интервал: %s сек. "
+        "Прокси в списке: %s. Скрытые поля: %s",
         len(REGISTRY_IDS),
         len(CHAT_IDS),
+        len(ADMIN_CHAT_IDS),
         CHECK_INTERVAL,
         len(POOL.proxies) or "нет (прямое подключение)",
         "показываются" if SHOW_HIDDEN_FIELDS else "не показываются",
@@ -1533,10 +1579,7 @@ def main():
     else:
         log.info("Подписка по паролю выключена (нет ACCESS_PASSWORD)")
 
-    try:
-        tg_send(startup_message())
-    except Exception:  # noqa: BLE001
-        log.exception("Не удалось отправить стартовое сообщение в Telegram")
+    announce_startup()
 
     while True:
         # Если сидим на резервном прокси - периодически пробуем вернуться
