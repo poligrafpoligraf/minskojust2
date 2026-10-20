@@ -1,5 +1,6 @@
 import os
 import re
+import html
 import json
 import time
 import logging
@@ -261,32 +262,45 @@ def all_recipients():
     return list(dict.fromkeys(CHAT_IDS + sorted(DYNAMIC_CHAT_IDS)))
 
 
-def tg_send_to(chat_id, text):
-    """Одному адресату. Длинный текст режется на части."""
+def strip_html(text):
+    """Текст с разметкой -> обычный текст (теги долой, &amp; обратно в &)."""
+    return html.unescape(re.sub(r"</?b>", "", text))
+
+
+def tg_send_to(chat_id, text, html_mode=False):
+    """Одному адресату. Длинный текст режется на части.
+
+    html_mode - текст с разметкой Telegram (<b>жирный</b>). Если Telegram
+    вдруг разметку не примет (400), то же сообщение уходит обычным текстом:
+    потерять уведомление из-за жирного шрифта было бы глупо."""
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     for chunk in split_message(text):
-        r = requests.post(
-            url,
-            json={"chat_id": chat_id, "text": chunk, "disable_web_page_preview": True},
-            timeout=15,
-        )
+        payload = {"chat_id": chat_id, "text": chunk, "disable_web_page_preview": True}
+        if html_mode:
+            payload["parse_mode"] = "HTML"
+        r = requests.post(url, json=payload, timeout=15)
+        if html_mode and r.status_code == 400:
+            log.warning("Telegram не принял разметку (%s), шлю обычным текстом", r.text[:200])
+            payload.pop("parse_mode")
+            payload["text"] = strip_html(chunk)
+            r = requests.post(url, json=payload, timeout=15)
         r.raise_for_status()
 
 
-def _broadcast(chat_ids, text, what):
+def _broadcast(chat_ids, text, what, html_mode=False):
     """Рассылка списку адресатов. Если для одного отправка не удалась
     (например, он заблокировал бота), это не мешает отправить остальным -
     ошибка просто попадёт в лог."""
     for chat_id in chat_ids:
         try:
-            tg_send_to(chat_id, text)
+            tg_send_to(chat_id, text, html_mode=html_mode)
         except Exception:  # noqa: BLE001
             log.exception("Не удалось отправить %s получателю %s", what, chat_id)
 
 
-def tg_send(text):
+def tg_send(text, html_mode=False):
     """Содержательное сообщение - всем получателям."""
-    _broadcast(all_recipients(), text, "сообщение")
+    _broadcast(all_recipients(), text, "сообщение", html_mode=html_mode)
 
 
 def tg_admin(text):
@@ -1076,7 +1090,28 @@ def fetch_info(registry_id):
 
 
 def fetch_rows(registry_id):
+    """Все записи реестра (без общего числа - см. fetch_snapshot)."""
+    return fetch_snapshot(registry_id)[0]
+
+
+def fetch_size(registry_id):
+    """Сколько записей в реестре, по мнению сайта. Один крошечный запрос:
+    просим одну строку, а поле size в ответе - общее число записей."""
+    r = request_via_proxy(
+        "POST",
+        f"{BASE}/rest/registry/{registry_id}/values",
+        json={"limit": 1, "offset": 0},
+        headers={"accept": "application/json"},
+        verify=VERIFY_SSL,
+        timeout=20,
+    )
+    r.raise_for_status()
+    return r.json().get("size")
+
+
+def fetch_snapshot(registry_id):
     """Забирает ВСЕ записи реестра, страницами по PAGE_SIZE.
+    Возвращает (записи, сколько записей заявил сайт).
 
     Один запрос отдаёт максимум 1000 строк независимо от запрошенного limit,
     поэтому идём по offset, пока не выберем всё (поле size в ответе - общее
@@ -1128,7 +1163,7 @@ def fetch_rows(registry_id):
             len(rows),
             total,
         )
-    return rows
+    return rows, total
 
 
 def build_labels(info):
@@ -1149,23 +1184,71 @@ def visible_fields(labels):
     ]
 
 
+# Как показывать поля в сообщениях. Подписи полей берутся из описания реестра
+# на сайте и местами огромны, поэтому часть сокращаем, часть не показываем.
+#
+# Поле с именем (ФИО / наименование) выделяется жирным - первое подходящее в
+# записи. Сокращения и скрытие - по началу подписи, без учёта регистра.
+NAME_LABEL = re.compile(r"^\s*(полное наименование|наименование|фио)", re.IGNORECASE)
+LABEL_SHORTEN = [
+    # Иноагенты: «Полное наименование (прежнее наименование (в случае его
+    # изменения)) / ФИО «Псевдоним» (при наличии) (прежние ФИО ...)»
+    (re.compile(r"^\s*Полное наименование\s*\(прежнее", re.IGNORECASE), "Полное наименование"),
+]
+# В карточке новой или удалённой записи не показываем. Правки в этих полях
+# по-прежнему приходят - это уже новость о самой записи.
+#   - иноагенты: «Основания для включения»
+#   - нежелательные: «Номер распоряжения Минюста России о включении в перечень»
+HIDE_IN_CARD = re.compile(
+    r"^\s*(Основани[яе] для включения|Номер распоряжения)",
+    re.IGNORECASE,
+)
+
+
+def esc(value):
+    """Экранирует текст для разметки Telegram (<, >, &)."""
+    return html.escape(str(value), quote=False)
+
+
+def short_label(human):
+    for pattern, short in LABEL_SHORTEN:
+        if pattern.match(human):
+            return short
+    return human
+
+
+def name_field(labels):
+    """Имя поля с ФИО / наименованием - первое подходящее среди видимых."""
+    for name in visible_fields(labels):
+        if NAME_LABEL.match(labels[name][0]):
+            return name
+    return None
+
+
 def row_title(row, labels):
-    """Короткая подпись записи для заголовка - ФИО или название организации."""
-    for name, (title, _) in labels.items():
-        if title.strip().lower() in ("фио", "наименование", "полное наименование"):
-            value = row.get(name)
-            if value:
-                return str(value)
-    return row.get("field_2_s") or f"запись {row.get('field_1_i', '?')}"
+    """Короткая подпись записи для заголовка - ФИО или название организации.
+    Обычный текст, без разметки."""
+    field = name_field(labels)
+    if field and row.get(field):
+        return str(row.get(field))
+    return str(row.get("field_2_s") or f"запись {row.get('field_1_i', '?')}")
 
 
 def format_row(row, labels):
+    """Карточка записи, с разметкой: имя жирным, длинные подписи короче."""
+    bold = name_field(labels)
     lines = []
     for name in visible_fields(labels):
         value = row.get(name)
-        if value not in (None, ""):
-            human, _ = labels[name]
-            lines.append(f"{human}: {value}")
+        if value in (None, ""):
+            continue
+        human, _ = labels[name]
+        if HIDE_IN_CARD.match(human):
+            continue
+        shown = esc(value)
+        if name == bold:
+            shown = f"<b>{shown}</b>"
+        lines.append(f"{esc(short_label(human))}: {shown}")
     return "\n".join(lines) if lines else "(пустая запись)"
 
 
@@ -1201,19 +1284,23 @@ def diff_rows(old, new, labels):
             before, after = old_row.get(name), new_row.get(name)
             if before != after:
                 human, _ = labels[name]
-                changes.append(f"  {human}:\n    было: {before or '(пусто)'}\n    стало: {after or '(пусто)'}")
+                changes.append(
+                    f"  {esc(short_label(human))}:\n"
+                    f"    было: {esc(before or '(пусто)')}\n"
+                    f"    стало: {esc(after or '(пусто)')}"
+                )
         if changes:
             title = row_title(new_row, labels)
             parts.append({
                 "kind": "changed",
                 "title": title,
-                "text": f"✏️ ИЗМЕНЕНА ЗАПИСЬ: {title}\n" + "\n".join(changes),
+                "text": f"✏️ ИЗМЕНЕНА ЗАПИСЬ: <b>{esc(title)}</b>\n" + "\n".join(changes),
             })
 
     return parts
 
 
-def format_diff(parts):
+def format_diff(parts, markup=False):
     """Текст изменений для сообщения. Если изменений слишком много - вместо
     полной простыни шлём сводку со списком имён/названий."""
     if len(parts) <= MAX_DIFF_ITEMS:
@@ -1235,7 +1322,7 @@ def format_diff(parts):
             continue
         lines.append(f"\n{headers[kind]}: {len(titles)}")
         shown = titles[:MAX_DIFF_ITEMS]
-        lines.extend(f"• {t}" for t in shown)
+        lines.extend(f"• {esc(t) if markup else t}" for t in shown)
         if len(titles) > len(shown):
             lines.append(f"…и ещё {len(titles) - len(shown)}")
     return "\n".join(lines)
@@ -1252,16 +1339,20 @@ DIFF_GROUPS = (
 )
 
 
-def send_changes(title, page_url, parts):
+def send_changes(title, page_url, parts, note=None):
     """Шлёт изменения, разбив по типам: добавления - одним сообщением,
-    удаления - другим, правки - третьим. Пустые группы пропускаем."""
+    удаления - другим, правки - третьим. Пустые группы пропускаем.
+
+    note - пояснение под ссылкой, например что записи пришли с опозданием."""
+    extra = f"\n{esc(note)}" if note else ""
     for kind, header in DIFF_GROUPS:
         group = [p for p in parts if p["kind"] == kind]
         if not group:
             continue
         tg_send(
-            f"🔔 {header}: {len(group)}\n{title}\n{page_url}\n\n"
-            f"{format_diff(group)}"
+            f"🔔 {header}: {len(group)}\n{esc(title)}\n{esc(page_url)}{extra}\n\n"
+            f"{format_diff(group, markup=True)}",
+            html_mode=True,
         )
 
 
@@ -1273,6 +1364,112 @@ REGISTRY_TITLES = {}
 
 def registry_title(registry_id):
     return REGISTRY_TITLES.get(registry_id) or f"реестр {registry_id}"
+
+
+# ---------------------------------------------------------------------------
+# Перепроверка реестров: метке lastModified верить, но проверять
+# ---------------------------------------------------------------------------
+# История 16.10.2026: в 17:00 метка реестра иноагентов сдвинулась, бот через
+# 13 секунд скачал записи - и получил СТАРЫЕ. Новые записи (Орлов, Логинова и
+# другие) появились в выдаче позже, а метка второй раз не сдвинулась. Бот,
+# который качал записи только по сдвигу метки, их так и не увидел.
+#
+# Похоже, записи отдаёт поисковый индекс (служебные поля _version_,
+# field_1_i, grid_s), а он догоняет базу с задержкой. Поэтому:
+#
+#   1. Первый ответ шлём сразу, как раньше, - скорость не страдает.
+#   2. После сдвига метки ещё RECHECK_TOTAL перекачиваем записи: первые
+#      RECHECK_FAST - каждый цикл, дальше - раз в RECHECK_SLOW.
+#   3. В обычное время раз в SIZE_CHECK одним крошечным запросом сверяем
+#      число записей; разошлось - полная выгрузка.
+#   4. Раз в FULL_REFRESH - полная выгрузка на всякий случай (ловит правки,
+#      при которых число записей не меняется).
+RECHECK_FAST = float(os.environ.get("RECHECK_FAST_SECONDS", str(15 * 60)))
+RECHECK_TOTAL = float(os.environ.get("RECHECK_TOTAL_SECONDS", str(2 * 3600)))
+RECHECK_SLOW = float(os.environ.get("RECHECK_SLOW_SECONDS", str(5 * 60)))
+SIZE_CHECK = float(os.environ.get("SIZE_CHECK_SECONDS", str(5 * 60)))
+FULL_REFRESH = float(os.environ.get("FULL_REFRESH_SECONDS", str(6 * 3600)))
+# Если перепроверка без сдвига метки вдруг «удаляет» больше этой доли записей
+# (но не меньше 5 штук) - не верим: скорее индекс на минуту отдал неполную
+# выдачу, чем Минюст тихо вычеркнул десятую часть реестра.
+MASS_REMOVAL_SHARE = 0.1
+
+
+def moscow_time(ms):
+    """Метка lastModified (миллисекунды) -> «16.10 в 17:00 МСК»."""
+    try:
+        t = datetime.fromtimestamp(int(ms) / 1000, ZoneInfo("Europe/Moscow"))
+        return t.strftime("%d.%m в %H:%M МСК")
+    except (TypeError, ValueError, OverflowError):
+        return str(ms)
+
+
+def recheck_reason(registry_id, registry_state, now):
+    """Пора ли перекачать записи, хотя метка не сдвинулась. Возвращает
+    причину словами или None."""
+    started = registry_state.get("recheck_from")
+    if started and now - started < RECHECK_TOTAL:
+        since_last = now - registry_state.get("recheck_last", 0)
+        if now - started < RECHECK_FAST or since_last >= RECHECK_SLOW:
+            return "после обновления реестра"
+
+    if now - registry_state.get("full_at", 0) >= FULL_REFRESH:
+        return "плановая сверка"
+
+    if now - registry_state.get("size_at", 0) >= SIZE_CHECK:
+        registry_state["size_at"] = now
+        try:
+            size = fetch_size(registry_id)
+        except Exception as e:  # noqa: BLE001
+            # Сама проверка реестра уже прошла; из-за сбоя дополнительного
+            # запроса источник поломанным не считаем.
+            log.warning("[%s] Не удалось сверить число записей: %s", registry_id, e)
+            return None
+        known = registry_state.get("size")
+        if size is not None and known is not None and size != known:
+            return f"число записей изменилось: {known} -> {size}"
+    return None
+
+
+def refetch_registry(registry_id, registry_state, labels, title, page_url, reason, now):
+    """Перекачивает записи без сдвига метки и шлёт то, что появилось."""
+    registry_state["recheck_last"] = now
+    prev_rows = registry_state["rows"]
+    new_rows, total = fetch_snapshot(registry_id)
+    registry_state["full_at"] = now
+
+    if total is not None and len(new_rows) < total and len(new_rows) < len(prev_rows):
+        log.warning(
+            "[%s] Перепроверка (%s): выдача неполная (%s из %s), снимок не трогаю",
+            title, reason, len(new_rows), total,
+        )
+        return False
+
+    parts = diff_rows(prev_rows, new_rows, labels)
+    if not parts:
+        registry_state["size"] = total if total is not None else len(new_rows)
+        log.info("[%s] Перепроверка (%s): без изменений", title, reason)
+        return False
+
+    removed = sum(1 for p in parts if p["kind"] == "removed")
+    if removed > max(5, MASS_REMOVAL_SHARE * len(prev_rows)):
+        log.warning(
+            "[%s] Перепроверка (%s): пропало %s записей разом - похоже на сбой "
+            "выдачи, снимок не трогаю",
+            title, reason, removed,
+        )
+        return False
+
+    log.info("[%s] Перепроверка (%s): найдено изменений - %s", title, reason, len(parts))
+    note = (
+        "⏱ С опозданием: сайт отметил обновление реестра "
+        f"{moscow_time(registry_state.get('lastModified'))}, но эти данные "
+        "появились в выдаче позже."
+    )
+    send_changes(title, page_url, parts, note=note)
+    registry_state["rows"] = new_rows
+    registry_state["size"] = total if total is not None else len(new_rows)
+    return True
 
 
 def check_registry(registry_id, registry_state):
@@ -1288,32 +1485,40 @@ def check_registry(registry_id, registry_state):
     prev_last_modified = registry_state.get("lastModified")
     prev_rows = registry_state.get("rows")
     prev_version = registry_state.get("version")
+    now = time.time()
 
     # Первый запуск для этого реестра (или потеря состояния) - просто
     # запоминаем текущую картину, без алерта. Снимок старого формата
     # (version < 2, снятый когда бот видел лишь первую 1000 строк) тоже
     # переснимаем молча, иначе прилетела бы пачка ложных "добавлено".
     if prev_last_modified is None or prev_rows is None or prev_version != STATE_VERSION:
+        rows, total = fetch_snapshot(registry_id)
         registry_state["lastModified"] = last_modified
-        registry_state["rows"] = fetch_rows(registry_id)
+        registry_state["rows"] = rows
         registry_state["version"] = STATE_VERSION
+        registry_state["size"] = total if total is not None else len(rows)
+        registry_state["full_at"] = now
         log.info(
             "[%s] %s: %s записей, lastModified=%s",
             title,
             "Инициализация" if prev_rows is None else "Пересъёмка снимка (новый формат)",
-            len(registry_state["rows"]),
+            len(rows),
             last_modified,
         )
         return True
 
     if last_modified == prev_last_modified:
+        reason = recheck_reason(registry_id, registry_state, now)
+        if reason:
+            return refetch_registry(registry_id, registry_state, labels, title, page_url, reason, now)
         log.info("[%s] Без изменений (lastModified=%s)", title, last_modified)
         return False
 
     log.info("[%s] Обнаружено изменение: %s -> %s", title, prev_last_modified, last_modified)
 
+    total = registry_state.get("size")
     try:
-        new_rows = fetch_rows(registry_id)
+        new_rows, total = fetch_snapshot(registry_id)
         parts = diff_rows(prev_rows, new_rows, labels)
     except Exception as e:  # noqa: BLE001
         log.exception("[%s] Не удалось получить содержимое реестра", title)
@@ -1321,23 +1526,32 @@ def check_registry(registry_id, registry_state):
         parts = None
         tg_send(
             f"🔔 Реестр обновился!\n{title}\n{page_url}\n\n"
-            f"(не удалось получить содержимое: {e})"
+            f"(не удалось получить содержимое: {e})\n"
+            f"Перепроверю в ближайшие {int(RECHECK_TOTAL // 3600)} ч."
         )
 
     if parts:
         send_changes(title, page_url, parts)
     elif parts is not None:
-        # метка времени сдвинулась, но видимые поля те же - могли
-        # поменяться скрытые или служебные поля
+        # Метка сдвинулась, а видимые поля те же. Либо правили скрытые поля,
+        # либо - как 16.10 - записи ещё не доехали до выдачи.
         tg_send(
             f"🔔 Реестр обновился!\n{title}\n{page_url}\n\n"
-            "Данные в видимых полях не изменились - вероятно, правка "
-            "коснулась скрытых или служебных полей."
+            "Сайт отметил обновление, но нового в выдаче пока нет. Так бывает: "
+            "метку ставят сразу, а записи появляются с задержкой. Перепроверяю "
+            f"следующие {int(RECHECK_TOTAL // 3600)} ч - что появится, пришлю "
+            "отдельно. (Ещё вариант - правили скрытые поля.)"
         )
 
     registry_state["lastModified"] = last_modified
     registry_state["rows"] = new_rows
     registry_state["version"] = STATE_VERSION
+    registry_state["size"] = total if total is not None else len(new_rows)
+    registry_state["full_at"] = now
+    # Запускаем окно перепроверок - даже если всё уже пришло: вторая порция
+    # могла доехать до выдачи не вся сразу.
+    registry_state["recheck_from"] = now
+    registry_state["recheck_last"] = now
     return True
 
 
