@@ -4,7 +4,7 @@ import json
 import time
 import logging
 from datetime import datetime, timedelta
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 import requests
@@ -66,6 +66,13 @@ ADMIN_CHAT_IDS = [
 CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL_SECONDS", "90"))  # 1,5 минуты по умолчанию
 STATE_FILE = os.environ.get("STATE_FILE", "state.json")
 ERROR_ALERT_THRESHOLD = int(os.environ.get("ERROR_ALERT_THRESHOLD", "3"))  # алерт в ТГ после N подряд ошибок
+# Дневник отказов (команда /stats). Живёт отдельным маленьким файлом рядом с
+# состоянием: его можно без зазрения совести перезаписывать каждый цикл, в
+# отличие от многомегабайтного state.json со снимками реестров.
+STATS_FILE = os.environ.get("STATS_FILE") or os.path.join(
+    os.path.dirname(STATE_FILE) or ".", "stats.json"
+)
+STATS_DAYS = int(os.environ.get("STATS_DAYS", "21"))  # за сколько дней хранить счёт
 # Потолок на общее число выкачиваемых записей - предохранитель, чтобы случайно
 # не начать тянуть реестр адвокатов на 157 тысяч строк.
 MAX_ROWS = int(os.environ.get("MAX_ROWS", "20000"))
@@ -194,6 +201,11 @@ SHOW_HIDDEN_FIELDS = os.environ.get("SHOW_HIDDEN_FIELDS", "false").strip().lower
 PROXY_EXPIRY_WARN_DAYS = int(os.environ.get("PROXY_EXPIRY_WARN_DAYS", "5"))
 # Как часто пробовать вернуться на основной прокси, если сидим на резервном.
 PROXY_RETURN_INTERVAL = float(os.environ.get("PROXY_RETURN_INTERVAL_SECONDS", str(30 * 60)))
+# Сколько отказов подряд должен набрать прокси, прежде чем о нём напишут.
+# Единичный сбой - это почти всегда моргнувшая сеть на другом конце, и
+# сообщать о нём людям незачем: за 10 дней наблюдений одиночные отказы дали
+# больше восьмидесяти сообщений и ни одного повода что-то сделать.
+PROXY_ALERT_THRESHOLD = int(os.environ.get("PROXY_ALERT_THRESHOLD", "3"))
 
 
 def load_proxies():
@@ -393,6 +405,16 @@ def handle_message(message, state):
         tg_send_to(chat_id, "\n".join(lines))
         return False
 
+    if text.startswith("/stats") and is_admin(chat_id):
+        # /stats - за неделю, /stats 21 - за три недели (сколько храним).
+        parts = text.split()
+        try:
+            days = int(parts[1]) if len(parts) > 1 else 7
+        except ValueError:
+            days = 7
+        tg_send_to(chat_id, STATS.report(max(1, min(days, STATS_DAYS))))
+        return False
+
     if chat_id in subscribers or is_permanent(chat_id):
         if text in ("/start", "/help"):
             tg_send_to(chat_id, "Вы уже получаете уведомления. Отписаться - /stop.")
@@ -520,6 +542,10 @@ class ProxyPool:
         # О каком прокси уже сообщили, что он лёг. Нужно, чтобы не слать
         # одно и то же сообщение каждые полчаса, пока он не починится.
         self.reported_dead = set()
+        # Сколько отказов подряд у каждого прокси. Обнуляется, как только
+        # через него проходит хоть один запрос. Нужно, чтобы не писать о
+        # каждом одиночном сбое: см. PROXY_ALERT_THRESHOLD.
+        self.fails = {}
 
     def enabled(self):
         return bool(self.proxies)
@@ -544,21 +570,37 @@ class ProxyPool:
         self.returned_at = time.time()
 
     def mark_success(self):
-        """Запрос через текущий прокси прошёл. Если мы про него писали, что
-        он лёг, - сообщаем, что ожил, и снимаем пометку."""
+        """Запрос через текущий прокси прошёл. Обнуляем ему счётчик отказов,
+        а если мы раньше писали, что он лёг, - сообщаем, что ожил."""
         proxy = self.current()
-        if proxy and proxy["n"] in self.reported_dead:
+        if not proxy:
+            return
+        self.fails[proxy["n"]] = 0
+        if proxy["n"] in self.reported_dead:
             self.reported_dead.discard(proxy["n"])
             tg_admin(f"✅ {proxy_label(proxy)} снова работает.")
 
     def switch_after_failure(self, error):
-        """Переходит на следующий прокси в списке."""
+        """Переходит на следующий прокси в списке.
+
+        Переключаемся молча: сообщение уходит только если прокси оступился
+        PROXY_ALERT_THRESHOLD раз подряд. Один сбой ничего не значит -
+        переключились, пошли дальше, человека не трогаем."""
         if len(self.proxies) < 2:
             return
         failed = self.current()
         self.index = (self.index + 1) % len(self.proxies)
         nxt = self.current()
-        log.warning("%s не отвечает (%s), перехожу на %s", proxy_label(failed), error, proxy_label(nxt))
+
+        self.fails[failed["n"]] = self.fails.get(failed["n"], 0) + 1
+        in_a_row = self.fails[failed["n"]]
+        log.warning(
+            "%s не отвечает (отказ %s подряд: %s), перехожу на %s",
+            proxy_label(failed), in_a_row, error, proxy_label(nxt),
+        )
+
+        if in_a_row < PROXY_ALERT_THRESHOLD:
+            return  # моргнуло - молчим
 
         # Сообщаем только про первый отказ этого прокси. Иначе, пока он лежит,
         # бот будет слать одно и то же каждые полчаса - при каждой попытке
@@ -568,16 +610,17 @@ class ProxyPool:
         self.reported_dead.add(failed["n"])
         alive = len(self.proxies) - len(self.reported_dead)
         tg_admin(
-            f"🔁 {proxy_label(failed)} не отвечает, перешёл на {proxy_label(nxt)}.\n"
+            f"🔁 {proxy_label(failed)} не отвечает (отказов подряд: {in_a_row}), "
+            f"перешёл на {proxy_label(nxt)}.\n"
             f"Рабочих прокси осталось: {alive} из {len(self.proxies)}.\n\n{error}"
         )
 
 
 POOL = ProxyPool(PROXY_LIST)
 
-# Ошибки, при которых виноват скорее прокси, чем сайт: до сайта вообще не
-# доехали. HTTP-коды и разбор страницы сюда не относятся - при них менять
-# прокси бессмысленно.
+# Ошибки, при которых запрос вообще не доехал до ответа. Только они и имеют
+# отношение к прокси. HTTP-коды и разбор страницы сюда не относятся - при них
+# менять прокси бессмысленно.
 NETWORK_ERRORS = (
     requests.exceptions.ProxyError,
     requests.exceptions.ConnectTimeout,
@@ -585,11 +628,90 @@ NETWORK_ERRORS = (
     requests.exceptions.ReadTimeout,
 )
 
+SITE = "сайт"
+PROXY = "прокси"
+
+
+def classify_error(error):
+    """Короткое человеческое имя отказа и кто в нём виноват.
+
+    Это главная развилка всей проксевой логики. Формально почти все отказы
+    приезжают одним классом ConnectionError, но по сути это две совершенно
+    разные беды:
+
+      • сломался сайт - прокси донёс запрос, а на другом конце его сбросили.
+        Перебирать прокси бессмысленно: следующий получит ту же ошибку.
+        Так и было: в логах за 10 дней 41 переключение из 44 случилось именно
+        поэтому. Видно это невооружённым глазом - три разных прокси в трёх
+        разных сетях «ломаются» подряд за четыре секунды с одной и той же
+        ошибкой на один и тот же адрес.
+
+      • сломался прокси - вот тут перебор и нужен, и он правда помогает:
+        в тех трёх случаях следующий прокси отвечал сразу.
+
+    Про DNS отдельно. Адреса у нас определяются локально, до того как в дело
+    вступит прокси (схема socks5://, а не socks5h://), поэтому «не
+    определился адрес» - никогда не вина прокси. Если когда-нибудь перейдём
+    на socks5h://, эту ветку надо будет пересмотреть."""
+    text = str(error)
+
+    # Дошло до TLS-рукопожатия - значит туннель до сайта прокси уже открыл.
+    if isinstance(error, requests.exceptions.SSLError):
+        return "обрыв TLS", SITE
+    if ("name resolution" in text
+            or "Name or service not known" in text
+            or "nodename nor servname" in text):
+        return "не определился адрес сайта (DNS)", SITE
+    # Коды ответа SOCKS5: 0x05 - сайт отклонил соединение, 0x04 - сайт
+    # недоступен. В обоих случаях прокси до сайта дошёл и честно передал отказ.
+    if "0x05" in text:
+        return "сайт отклонил соединение", SITE
+    if "0x04" in text:
+        return "сайт недоступен", SITE
+    if "Connection closed unexpectedly" in text:
+        return "сайт закрыл соединение", SITE
+    if "RemoteDisconnected" in text or "Connection aborted" in text:
+        # Поток оборвался уже после того, как туннель через прокси открылся, -
+        # значит закрыли с другой стороны. Если бы оступился сам прокси,
+        # requests отдал бы ProxyError.
+        if not isinstance(error, requests.exceptions.ProxyError):
+            return "сайт оборвал ответ", SITE
+        return "прокси оборвал соединение", PROXY
+
+    # Дальше - то, в чём виноват скорее прокси.
+    # 0x01: прокси запрос принял, но подключиться к сайту не смог. Природа
+    # честно неясна, а перебор тут по логам помогал - значит считаем виноватым
+    # прокси и переключаемся.
+    if "0x01" in text:
+        return "прокси не смог подключиться к сайту", PROXY
+    if "Proxy Authentication" in text or "authentication failed" in text.lower():
+        return "прокси не принял логин или пароль", PROXY
+    if isinstance(error, requests.exceptions.ReadTimeout):
+        return "нет ответа (таймаут чтения)", PROXY
+    if isinstance(error, requests.exceptions.ConnectTimeout):
+        return "таймаут подключения", PROXY
+    # Сюда попадает главный случай, ради которого вся эта схема и заведена:
+    # прокси перестал отвечать совсем (кончилась оплата, лёг сервер).
+    if ("Unable to connect to proxy" in text
+            or isinstance(error, requests.exceptions.ProxyError)):
+        return "не отвечает сам прокси", PROXY
+    return f"прочее ({type(error).__name__})", PROXY
+
+
+def is_site_error(error):
+    """True, если виноват сайт и менять из-за этого прокси бессмысленно."""
+    return classify_error(error)[1] == SITE
+
 
 def request_via_proxy(method, url, **kwargs):
-    """requests.request, но с перебором прокси при сетевых отказах."""
+    """requests.request, но с перебором прокси при тех отказах, в которых
+    прокси действительно может быть виноват."""
     if not POOL.enabled():
-        return requests.request(method, url, proxies=None, **kwargs)
+        try:
+            return requests.request(method, url, proxies=None, **kwargs)
+        except NETWORK_ERRORS as e:
+            STATS.failure(e, url)
+            raise
 
     attempts = len(POOL.proxies)
     last_error = None
@@ -597,6 +719,12 @@ def request_via_proxy(method, url, **kwargs):
         try:
             response = requests.request(method, url, proxies=POOL.as_requests_dict(), **kwargs)
         except NETWORK_ERRORS as e:
+            STATS.failure(e, url)
+            if is_site_error(e):
+                # Прокси исправен, сломался сайт - отдаём ошибку наверх как
+                # есть, пусть с ней разбирается обычный учёт поломок
+                # источников. Остальные прокси не трогаем.
+                raise
             last_error = e
             # Перебираем ровно по разу каждый прокси из списка: переключаемся
             # после каждой неудачи, кроме последней попытки.
@@ -606,6 +734,179 @@ def request_via_proxy(method, url, **kwargs):
         POOL.mark_success()
         return response
     raise last_error
+
+
+# ---------------------------------------------------------------------------
+# Дневник отказов: сколько проверок, сколько сбоев и какой природы
+# ---------------------------------------------------------------------------
+
+class Stats:
+    """Считает по дням, сколько раз каждый источник опрашивали, сколько раз
+    он не ответил и по какой причине.
+
+    Зачем это надо. Railway отдаёт логи порциями по тысяче строк - это
+    примерно пять часов. А вопрос «часто ли это вообще случается и становится
+    ли хуже» требует недель. Поэтому бот ведёт счёт сам, в отдельном
+    небольшом файле, и показывает его по команде /stats.
+
+    Ни одна ошибка внутри этого класса не должна ронять бота: статистика
+    полезна, но следить за реестрами важнее. Поэтому всё в try."""
+
+    def __init__(self):
+        self.days = {}
+        self.dirty = False
+
+    # -- хранение ----------------------------------------------------------
+
+    def load(self):
+        try:
+            with open(STATS_FILE, encoding="utf-8") as f:
+                self.days = json.load(f)
+        except FileNotFoundError:
+            self.days = {}
+        except Exception:  # noqa: BLE001
+            log.exception("Не удалось прочитать дневник отказов, начинаю заново")
+            self.days = {}
+        self._trim()
+
+    def save(self):
+        """Пишет файл, только если с прошлого раза что-то изменилось."""
+        if not self.dirty:
+            return
+        try:
+            directory = os.path.dirname(STATS_FILE)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            with open(STATS_FILE, "w", encoding="utf-8") as f:
+                json.dump(self.days, f, ensure_ascii=False)
+            self.dirty = False
+        except Exception:  # noqa: BLE001
+            log.exception("Не удалось сохранить дневник отказов")
+
+    def _trim(self):
+        for day in sorted(self.days)[:-STATS_DAYS]:
+            self.days.pop(day, None)
+
+    def _today(self):
+        key = datetime.now(ZoneInfo(PAGE_CHECK_TZ)).strftime("%Y-%m-%d")
+        day = self.days.get(key)
+        if day is None:
+            day = self.days[key] = {"sources": {}, "reasons": {}}
+            self._trim()
+        day.setdefault("sources", {})
+        day.setdefault("reasons", {})
+        self.dirty = True
+        return day
+
+    # -- запись ------------------------------------------------------------
+
+    def check(self, key, title, error=None):
+        """Одна проверка источника - удачная или нет."""
+        try:
+            record = self._today()["sources"].setdefault(
+                key, {"title": title, "ok": 0, "fail": 0}
+            )
+            record["title"] = title
+            record["fail" if error is not None else "ok"] += 1
+        except Exception:  # noqa: BLE001
+            log.exception("Не удалось записать проверку в дневник")
+
+    def failure(self, error, url):
+        """Один сетевой отказ: запоминаем его природу и адрес."""
+        try:
+            reason, blame = classify_error(error)
+            host = urlparse(url).hostname or url
+            bucket = self._today()["reasons"].setdefault(
+                reason, {"count": 0, "blame": blame, "hosts": {}}
+            )
+            bucket["count"] += 1
+            bucket["blame"] = blame
+            bucket["hosts"][host] = bucket["hosts"].get(host, 0) + 1
+        except Exception:  # noqa: BLE001
+            log.exception("Не удалось записать отказ в дневник")
+
+    # -- сводка ------------------------------------------------------------
+
+    @staticmethod
+    def _pretty(day_key):
+        try:
+            return datetime.strptime(day_key, "%Y-%m-%d").strftime("%d.%m")
+        except ValueError:
+            return day_key
+
+    def report(self, days=7):
+        """Текст сводки для команды /stats."""
+        keys = sorted(self.days)[-days:]
+        if not keys:
+            return "📊 Дневник пока пуст - бот только начал считать."
+
+        sources = {}
+        reasons = {}
+        per_day = []
+        for key in keys:
+            day = self.days.get(key) or {}
+            fails_that_day = 0
+            for src, record in (day.get("sources") or {}).items():
+                acc = sources.setdefault(
+                    src, {"title": record.get("title") or src, "ok": 0, "fail": 0}
+                )
+                acc["title"] = record.get("title") or acc["title"]
+                acc["ok"] += record.get("ok", 0)
+                acc["fail"] += record.get("fail", 0)
+                # По дням считаем именно неудачные проверки, а не сетевые
+                # отказы: проверка может сорваться и без сетевой ошибки
+                # (не разобралась страница, сайт ответил пятисоткой), а в
+                # вопросе «часто ли вообще валится» важно как раз это.
+                fails_that_day += record.get("fail", 0)
+            for reason, record in (day.get("reasons") or {}).items():
+                acc = reasons.setdefault(
+                    reason, {"count": 0, "blame": record.get("blame") or "?", "hosts": {}}
+                )
+                acc["count"] += record.get("count", 0)
+                acc["blame"] = record.get("blame") or acc["blame"]
+                for host, n in (record.get("hosts") or {}).items():
+                    acc["hosts"][host] = acc["hosts"].get(host, 0) + n
+            per_day.append((key, fails_that_day))
+
+        lines = [
+            f"📊 Статистика за {len(keys)} дн "
+            f"({self._pretty(keys[0])} - {self._pretty(keys[-1])})",
+            "",
+            "Источники:",
+        ]
+        for record in sorted(sources.values(), key=lambda r: -r["fail"]):
+            total = record["ok"] + record["fail"]
+            if record["fail"] and total:
+                tail = f"сбоев {record['fail']} ({100 * record['fail'] / total:.1f}%)"
+            else:
+                tail = "без сбоев"
+            lines.append(f"• {record['title']} - проверок {total}, {tail}")
+
+        if reasons:
+            lines += ["", "Отказы по причинам:"]
+            by_blame = {}
+            for reason, record in sorted(reasons.items(), key=lambda kv: -kv[1]["count"]):
+                hosts = sorted(record["hosts"], key=lambda h: -record["hosts"][h])[:3]
+                lines.append(
+                    f"• {record['count']} x {reason} — виноват "
+                    f"{record['blame']} ({', '.join(hosts)})"
+                )
+                by_blame[record["blame"]] = by_blame.get(record["blame"], 0) + record["count"]
+            parts = ", ".join(
+                f"{blame} - {n}" for blame, n in sorted(by_blame.items(), key=lambda kv: -kv[1])
+            )
+            lines += ["", f"Всего отказов: {sum(by_blame.values())} ({parts})."]
+        else:
+            lines += ["", "Отказов не было ни одного."]
+
+        lines += ["", "Неудачных проверок по дням:"]
+        for key, n in reversed(per_day):
+            lines.append(f"• {self._pretty(key)} - {n if n else 'чисто'}")
+
+        return "\n".join(lines)
+
+
+STATS = Stats()
 
 
 # ---------------------------------------------------------------------------
@@ -650,9 +951,11 @@ class Problems:
 
     def ok(self, key, title):
         self.cycle.append((key, title, None))
+        STATS.check(key, title, None)
 
     def failed(self, key, title, error):
         self.cycle.append((key, title, error))
+        STATS.check(key, title, error)
 
     # -- внутреннее --------------------------------------------------------
 
@@ -962,6 +1265,16 @@ def send_changes(title, page_url, parts):
         )
 
 
+# Названия реестров, как их отдаёт API. Нужны, чтобы в сообщениях о поломках
+# и в статистике стояло человеческое имя, а не UUID. Заполняется на ходу - при
+# старте и при каждой проверке.
+REGISTRY_TITLES = {}
+
+
+def registry_title(registry_id):
+    return REGISTRY_TITLES.get(registry_id) or f"реестр {registry_id}"
+
+
 def check_registry(registry_id, registry_state):
     """Проверяет один реестр. registry_state - словарь для этого конкретного
     реестра внутри общего state (может быть пустым при первом запуске)."""
@@ -970,6 +1283,7 @@ def check_registry(registry_id, registry_state):
     info = fetch_info(registry_id)
     labels = build_labels(info)
     title = info.get("title", registry_id)
+    REGISTRY_TITLES[registry_id] = title
     last_modified = info.get("lastModified")
     prev_last_modified = registry_state.get("lastModified")
     prev_rows = registry_state.get("rows")
@@ -1482,6 +1796,7 @@ def startup_message():
     for registry_id in REGISTRY_IDS:
         try:
             title = fetch_info(registry_id).get("title") or registry_id
+            REGISTRY_TITLES[registry_id] = title
         except Exception:  # noqa: BLE001
             log.exception("[%s] Не удалось получить название для стартового сообщения", registry_id)
             title = registry_id
@@ -1508,6 +1823,7 @@ def startup_message():
     )
     if ACCESS_PASSWORD:
         tail += "\nНовые подписчики: /start боту и пароль."
+    tail += "\nСтатистика отказов: /stats (или /stats 21 - за три недели)."
     lines.append(tail)
     return "\n".join(lines)
 
@@ -1567,6 +1883,7 @@ def main():
         "показываются" if SHOW_HIDDEN_FIELDS else "не показываются",
     )
     state = load_state()
+    STATS.load()
 
     # Поднимаем подписавшихся по паролю из файла состояния.
     DYNAMIC_CHAT_IDS.update({cid: True for cid in state.get("subscribers", {})})
@@ -1593,14 +1910,10 @@ def main():
             changed = False
             try:
                 changed = check_registry(registry_id, registry_state)
-                PROBLEMS.ok(f"reg:{registry_id}", registry_id)
+                PROBLEMS.ok(f"reg:{registry_id}", registry_title(registry_id))
             except Exception as e:  # noqa: BLE001
                 log.exception("[%s] Ошибка проверки: %s", registry_id, e)
-                PROBLEMS.failed(
-                    f"reg:{registry_id}",
-                    f"реестр {BASE}/#/registry/{registry_id}",
-                    e,
-                )
+                PROBLEMS.failed(f"reg:{registry_id}", registry_title(registry_id), e)
             finally:
                 # Пишем файл состояния только когда там правда что-то
                 # поменялось. В покое реестры не меняются неделями, а файл
@@ -1647,6 +1960,8 @@ def main():
 
         # Разбор итогов цикла: решаем, о чём писать людям, а о чём смолчать.
         PROBLEMS.end_cycle()
+        # Дневник отказов - свой маленький файл, его переписывать не жалко.
+        STATS.save()
 
         # Паузу между проверками проводим не во сне, а слушая входящие:
         # так подписка по паролю отвечает сразу, а не через полтора цикла.
